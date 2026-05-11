@@ -1,0 +1,58 @@
+{
+  "folder": "C:\\Users\\pavel\\Desktop\\AVCR\\codes\\sem_coverage\\testData\\100226\\PVP 10kDa, 1x AgNPs",
+  "summary_json_path": null,
+  "viewer": {
+    "analyzer": {
+      "infobar_tail_rows": 320,
+      "infobar_k_mad": 8.0,
+      "infobar_min_run": 10,
+      "norm_percentiles": [
+        2.0,
+        98.0
+      ],
+      "bead_blur_sigma": 2.0,
+      "bead_closing_radius": 5,
+      "bead_opening_radius": 3,
+      "bead_hole_area": 5000,
+      "ag_tophat_radius": 9,
+      "ag_min_object_size": 5,
+      "ag_erode_bead_radius": 2,
+      "ag_use_log": false,
+      "count_min_distance": 5,
+      "count_thr_rel": 1.0,
+      "display_percentiles": [
+        0.5,
+        99.5
+      ]
+    },
+    "min_bead_area_px": 500,
+    "min_roi_eq_diameter_px": 140.0,
+    "min_roi_solidity": 0.82,
+    "max_roi_anisotropy_ratio": 1.65,
+    "sphere_anisotropy_check": true,
+    "max_global_sphere_anisotropy_ratio": 1.25,
+    "sphere_solidity_check": true,
+    "min_global_sphere_solidity": 0.9,
+    "salvage_open_radius_px": 7,
+    "split_touching_beads": true,
+    "split_trigger_eq_diameter_px": 430.0,
+    "split_trigger_anisotropy_ratio": 1.45,
+    "split_trigger_solidity_below": 0.9,
+    "split_min_distance_px": 70,
+    "split_peak_threshold_rel": 0.55,
+    "split_max_peaks": 4,
+    "split_min_child_area_ratio": 0.18,
+    "ag_enable_secondary_coverage": true,
+    "ag_coverage_tophat_radius": 15,
+    "ag_coverage_threshold_rel": 0.9,
+    "ag_coverage_min_object_size": 9,
+    "ag_coverage_closing_radius": 1,
+    "ag_coverage_use_union_with_count": true,
+    "default_show_scale": true,
+    "default_show_bead_boundary": true,
+    "default_show_diameter_lines": true,
+    "default_show_ag_boundary": true,
+    "default_show_ag_count_boundary": false,
+    "default_show_ag_peaks": false
+  }
+}
