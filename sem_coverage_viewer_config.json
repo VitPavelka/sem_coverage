@@ -1,5 +1,6 @@
 {
-  "folder": "C:\\Users\\pavel\\Desktop\\AVCR\\codes\\sem_coverage\\testData\\100226\\PVP 10kDa, 1x AgNPs",
+  "folder": "/home/vitpavelka/Projects/sem_coverage/Ag_na_PS_kuličkách",
+  "file": null,
   "summary_json_path": null,
   "viewer": {
     "analyzer": {
@@ -25,6 +26,7 @@
         99.5
       ]
     },
+    "detector_choice_index": 0,
     "min_bead_area_px": 500,
     "min_roi_eq_diameter_px": 140.0,
     "min_roi_solidity": 0.82,
@@ -34,6 +36,14 @@
     "sphere_solidity_check": true,
     "min_global_sphere_solidity": 0.9,
     "salvage_open_radius_px": 7,
+    "bead_morph_fallback": true,
+    "bead_morph_downscale": 0.25,
+    "bead_morph_blur_sigma": 4.0,
+    "bead_morph_gradient_percentile": 80.0,
+    "bead_morph_close_radius": 2,
+    "bead_morph_dilate_radius": 2,
+    "bead_morph_erode_radius_px": 20,
+    "bead_morph_min_object_area_ratio": 0.08,
     "split_touching_beads": true,
     "split_trigger_eq_diameter_px": 430.0,
     "split_trigger_anisotropy_ratio": 1.45,
@@ -44,7 +54,14 @@
     "split_min_child_area_ratio": 0.18,
     "ag_enable_secondary_coverage": true,
     "ag_coverage_tophat_radius": 15,
-    "ag_coverage_threshold_rel": 0.9,
+    "ag_coverage_tophat_radii": [
+      15,
+      25
+    ],
+    "ag_coverage_threshold_rel": 0.8,
+    "ag_coverage_adaptive_threshold": true,
+    "ag_coverage_adaptive_block_size": 151,
+    "ag_coverage_adaptive_k_std": 2.0,
     "ag_coverage_min_object_size": 9,
     "ag_coverage_closing_radius": 1,
     "ag_coverage_use_union_with_count": true,

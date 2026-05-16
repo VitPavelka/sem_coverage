@@ -14,11 +14,12 @@ from scipy import ndimage as ndi
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import CheckButtons
-from skimage.filters import threshold_otsu
+from skimage.filters import gaussian, sobel, threshold_otsu
 from skimage.feature import peak_local_max
 from skimage.measure import label, regionprops
 from skimage.morphology import closing, dilation, disk, erosion, opening, remove_small_holes, remove_small_objects, white_tophat
-from skimage.segmentation import find_boundaries, watershed
+from skimage.segmentation import clear_border, find_boundaries, watershed
+from skimage.transform import resize, rescale
 from tifffile import imread
 
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
@@ -27,6 +28,7 @@ from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
 @dataclass(frozen=True)
 class CoverageViewerConfig:
     analyzer: AnalyzerConfig = AnalyzerConfig()
+    detector_choice_index: int = 0
     min_bead_area_px: int = 500
     min_roi_eq_diameter_px: float = 140.0
     min_roi_solidity: float = 0.82
@@ -36,6 +38,14 @@ class CoverageViewerConfig:
     sphere_solidity_check: bool = False
     min_global_sphere_solidity: float = 0.90
     salvage_open_radius_px: int = 7
+    bead_morph_fallback: bool = True
+    bead_morph_downscale: float = 0.25
+    bead_morph_blur_sigma: float = 4.0
+    bead_morph_gradient_percentile: float = 80.0
+    bead_morph_close_radius: int = 2
+    bead_morph_dilate_radius: int = 2
+    bead_morph_erode_radius_px: int = 20
+    bead_morph_min_object_area_ratio: float = 0.08
     split_touching_beads: bool = True
     split_trigger_eq_diameter_px: float = 430.0
     split_trigger_anisotropy_ratio: float = 1.45
@@ -46,7 +56,11 @@ class CoverageViewerConfig:
     split_min_child_area_ratio: float = 0.18
     ag_enable_secondary_coverage: bool = False
     ag_coverage_tophat_radius: int = 15
-    ag_coverage_threshold_rel: float = 0.9
+    ag_coverage_tophat_radii: Optional[list[int]] = None
+    ag_coverage_threshold_rel: float = 0.8
+    ag_coverage_adaptive_threshold: bool = True
+    ag_coverage_adaptive_block_size: int = 151
+    ag_coverage_adaptive_k_std: float = 2.0
     ag_coverage_min_object_size: int = 9
     ag_coverage_closing_radius: int = 1
     ag_coverage_use_union_with_count: bool = True
@@ -61,6 +75,7 @@ class CoverageViewerConfig:
 @dataclass(frozen=True)
 class CoverageAppConfig:
     folder: str
+    file: Optional[str] = None
     viewer: CoverageViewerConfig = CoverageViewerConfig()
     summary_json_path: Optional[str] = None
 
@@ -71,6 +86,8 @@ class SEMMetadata:
     pixel_size_y_m: Optional[float]
     magnification: Optional[float]
     image_strip_size_px: Optional[int]
+    view_fields_count_x: Optional[int]
+    view_fields_count_y: Optional[int]
     note: str
     device: str
     date: str
@@ -141,6 +158,16 @@ class CoverageImageResult:
     config: CoverageViewerConfig
 
 
+@dataclass(frozen=True)
+class FailedImagePreview:
+    image_path: Path
+    cropped: np.ndarray
+    norm: np.ndarray
+    display: np.ndarray
+    metadata: SEMMetadata
+    crop_row: int
+
+
 def _dataclass_from_dict(cls, data: dict):
     kwargs = {}
     for field in fields(cls):
@@ -158,6 +185,17 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     viewer_data = dict(data.get("viewer", {}))
     analyzer_data = dict(viewer_data.get("analyzer", {}))
+    for legacy_key in (
+        "bead_hough_fallback",
+        "bead_hough_downscale",
+        "bead_hough_blur_sigma",
+        "bead_hough_canny_low_threshold",
+        "bead_hough_canny_high_threshold",
+        "bead_hough_min_radius_ratio",
+        "bead_hough_max_radius_ratio",
+        "bead_hough_min_score",
+    ):
+        viewer_data.pop(legacy_key, None)
     if "norm_percentiles" in analyzer_data:
         analyzer_data["norm_percentiles"] = tuple(analyzer_data["norm_percentiles"])
     if "display_percentiles" in analyzer_data:
@@ -167,6 +205,7 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
     viewer = CoverageViewerConfig(**viewer_data)
     return CoverageAppConfig(
         folder=data["folder"],
+        file=data.get("file") or None,
         viewer=viewer,
         summary_json_path=data.get("summary_json_path"),
     )
@@ -175,6 +214,7 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
 def save_default_config(config_path: str | Path, folder: str | Path) -> None:
     config = CoverageAppConfig(
         folder=str(folder),
+        file=None,
         summary_json_path=str(Path(folder).resolve() / "sem_coverage_viewer_summary.json"),
     )
     Path(config_path).write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
@@ -194,11 +234,22 @@ def _read_hdr_metadata(hdr_path: Path) -> SEMMetadata:
         except ValueError:
             return None
 
+    def _maybe_int(key: str) -> Optional[int]:
+        value = main.get(key)
+        if value in (None, ""):
+            return None
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+
     return SEMMetadata(
         pixel_size_x_m=_maybe_float("PixelSizeX"),
         pixel_size_y_m=_maybe_float("PixelSizeY"),
         magnification=_maybe_float("Magnification"),
-        image_strip_size_px=int(float(main["ImageStripSize"])) if main.get("ImageStripSize") else None,
+        image_strip_size_px=_maybe_int("ImageStripSize"),
+        view_fields_count_x=_maybe_int("ViewFieldsCountX"),
+        view_fields_count_y=_maybe_int("ViewFieldsCountY"),
         note=main.get("Note", ""),
         device=main.get("Device", ""),
         date=main.get("Date", ""),
@@ -217,6 +268,32 @@ def _crop_infobar(img: np.ndarray, analyzer: SEMCoverageAnalyzer, strip_rows: Op
         crop_row = img.shape[0] - int(strip_rows)
         return img[:crop_row, :], crop_row
     return analyzer._crop_infobar(img)
+
+
+def _select_detector_view(img: np.ndarray, metadata: SEMMetadata, detector_choice_index: int) -> np.ndarray:
+    count_x = metadata.view_fields_count_x or 1
+    count_y = metadata.view_fields_count_y or 1
+    detector_count = int(count_x * count_y)
+    if detector_count <= 1:
+        return img
+
+    index = int(detector_choice_index)
+    if index < 0 or index >= detector_count:
+        raise ValueError(
+            f"detector_choice_index={index} is outside available detector views "
+            f"0..{detector_count - 1} ({count_x}x{count_y})."
+        )
+    if img.shape[1] % count_x != 0 or img.shape[0] % count_y != 0:
+        raise ValueError(
+            f"Cannot split image shape {img.shape} into detector view grid "
+            f"{count_x}x{count_y}."
+        )
+
+    row = index // count_x
+    col = index % count_x
+    tile_h = img.shape[0] // count_y
+    tile_w = img.shape[1] // count_x
+    return img[row * tile_h : (row + 1) * tile_h, col * tile_w : (col + 1) * tile_w]
 
 
 def _segment_bead_components(analyzer: SEMCoverageAnalyzer, norm: np.ndarray, min_bead_area_px: int) -> list[np.ndarray]:
@@ -346,6 +423,57 @@ def _salvage_roi_by_opening(mask: np.ndarray, config: CoverageViewerConfig, hole
     return restored if _is_valid_roi(restored, config) else None
 
 
+def _segment_bead_by_morphology(
+    analyzer: SEMCoverageAnalyzer,
+    cropped: np.ndarray,
+    config: CoverageViewerConfig,
+) -> list[np.ndarray]:
+    scale = float(config.bead_morph_downscale)
+    if not 0.05 <= scale <= 1.0:
+        raise SegmentationError("Morphology bead fallback failed: bead_morph_downscale must be between 0.05 and 1.0.")
+
+    display = analyzer._scale_for_display(cropped)
+    small = rescale(display, scale, anti_aliasing=True, preserve_range=True).astype(np.float32)
+    smooth = gaussian(small, sigma=float(config.bead_morph_blur_sigma), preserve_range=True)
+    gradient = sobel(smooth)
+    threshold = float(np.percentile(gradient, float(config.bead_morph_gradient_percentile)))
+    edges = gradient > threshold
+    if not np.any(edges):
+        raise SegmentationError("Morphology bead fallback failed: no edge pixels after gradient thresholding.")
+
+    close_radius = max(1, int(config.bead_morph_close_radius))
+    dilate_radius = max(0, int(config.bead_morph_dilate_radius))
+    mask = closing(edges, disk(close_radius))
+    if dilate_radius > 0:
+        mask = dilation(mask, disk(dilate_radius))
+    mask = ndi.binary_fill_holes(mask)
+    mask = clear_border(mask)
+    min_size = max(1, int(cropped.shape[0] * cropped.shape[1] * float(config.bead_morph_min_object_area_ratio) * scale * scale))
+    lab = label(mask.astype(bool))
+    if lab.max() > 0:
+        keep = np.zeros(mask.shape, dtype=bool)
+        for region in regionprops(lab):
+            if int(region.area) >= min_size:
+                keep[lab == region.label] = True
+        mask = keep
+    lab = label(mask)
+    if lab.max() == 0:
+        raise SegmentationError("Morphology bead fallback failed: no enclosed component found.")
+
+    candidates = []
+    for region in sorted(regionprops(lab), key=lambda item: item.area, reverse=True):
+        small_component = lab == region.label
+        bead = resize(small_component, cropped.shape, order=0, preserve_range=True, anti_aliasing=False).astype(bool)
+        erode_radius = int(config.bead_morph_erode_radius_px)
+        if erode_radius > 0:
+            bead = erosion(bead, disk(erode_radius))
+        if _is_valid_roi(bead, config):
+            candidates.append(bead)
+    if candidates:
+        return [candidates[0]]
+    raise SegmentationError("Morphology bead fallback failed: no enclosed component passed ROI filters.")
+
+
 def _refine_bead_components(components: list[np.ndarray], config: CoverageViewerConfig) -> list[np.ndarray]:
     refined: list[np.ndarray] = []
     for component in components:
@@ -361,7 +489,21 @@ def _refine_bead_components(components: list[np.ndarray], config: CoverageViewer
         if salvaged is not None:
             refined.append(salvaged)
     if not refined:
-        raise SegmentationError("Bead segmentation failed: no valid bead-like ROI remained after filtering.")
+        component_stats = []
+        for component in components:
+            stats = _region_stats(component)
+            if stats is None:
+                continue
+            component_stats.append(stats)
+        component_stats.sort(key=lambda item: item["area"], reverse=True)
+        details = []
+        for stats in component_stats[:3]:
+            details.append(
+                "area={area:.0f}, eq_diam={equivalent_diameter_px:.1f}px, "
+                "solidity={solidity:.3f}, anisotropy={anisotropy_ratio:.3f}".format(**stats)
+            )
+        suffix = f" Largest rejected components: {'; '.join(details)}." if details else ""
+        raise SegmentationError(f"Bead segmentation failed: no valid bead-like ROI remained after filtering.{suffix}")
     return refined
 
 
@@ -388,12 +530,16 @@ def _segment_ag_coverage(
     if cfg.ag_use_log:
         img_f = np.log1p(img_f)
 
-    coverage_fp = disk(max(1, int(analyzer.config.ag_tophat_radius)))
     viewer_radius = max(1, int(analyzer.config.ag_tophat_radius))
     if hasattr(analyzer, "_viewer_coverage_tophat_radius"):
         viewer_radius = int(analyzer._viewer_coverage_tophat_radius)
-    coverage_fp = disk(max(1, viewer_radius))
-    feat = white_tophat(img_f, footprint=coverage_fp).astype(np.float32)
+    viewer_radii = getattr(analyzer, "_viewer_coverage_tophat_radii", None)
+    radii = [int(r) for r in viewer_radii] if viewer_radii else [viewer_radius]
+    radii = sorted({max(1, int(r)) for r in radii})
+    feat = np.zeros(img_f.shape, dtype=np.float32)
+    for radius in radii:
+        radius_feat = white_tophat(img_f, footprint=disk(radius)).astype(np.float32)
+        feat = np.maximum(feat, radius_feat)
 
     vals = feat[roi]
     if vals.size < 500:
@@ -405,6 +551,17 @@ def _segment_ag_coverage(
 
     thr_rel = getattr(analyzer, "_viewer_coverage_threshold_rel", 1.0)
     mask = (feat > (t * float(thr_rel))) & roi
+    if bool(getattr(analyzer, "_viewer_coverage_adaptive_threshold", False)):
+        block_size = int(getattr(analyzer, "_viewer_coverage_adaptive_block_size", 151))
+        if block_size % 2 == 0:
+            block_size += 1
+        block_size = max(15, block_size)
+        local_mean = ndi.uniform_filter(feat, size=block_size, mode="reflect")
+        local_sq_mean = ndi.uniform_filter(feat * feat, size=block_size, mode="reflect")
+        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean * local_mean, 0.0))
+        k_std = float(getattr(analyzer, "_viewer_coverage_adaptive_k_std", 1.8))
+        adaptive_mask = (feat > (local_mean + k_std * local_std)) & roi
+        mask |= adaptive_mask
     min_size = int(getattr(analyzer, "_viewer_coverage_min_object_size", cfg.ag_min_object_size))
     if min_size > 1:
         mask = remove_small_objects(mask, max_size=min_size - 1)
@@ -504,7 +661,11 @@ def _build_roi_result(
 ) -> BeadCoverageResult:
     count_mask, count_feat, count_thr = analyzer._segment_ag(cropped, bead_mask)
     analyzer._viewer_coverage_tophat_radius = int(config.ag_coverage_tophat_radius)
+    analyzer._viewer_coverage_tophat_radii = config.ag_coverage_tophat_radii
     analyzer._viewer_coverage_threshold_rel = float(config.ag_coverage_threshold_rel)
+    analyzer._viewer_coverage_adaptive_threshold = bool(config.ag_coverage_adaptive_threshold)
+    analyzer._viewer_coverage_adaptive_block_size = int(config.ag_coverage_adaptive_block_size)
+    analyzer._viewer_coverage_adaptive_k_std = float(config.ag_coverage_adaptive_k_std)
     analyzer._viewer_coverage_min_object_size = int(config.ag_coverage_min_object_size)
     analyzer._viewer_coverage_closing_radius = int(config.ag_coverage_closing_radius)
     analyzer._viewer_coverage_use_union_with_count = bool(config.ag_coverage_use_union_with_count)
@@ -548,23 +709,29 @@ def _build_roi_result(
 
 def analyze_coverage_image(image_path: str | Path, config: CoverageViewerConfig) -> CoverageImageResult:
     image_path = Path(image_path)
-    hdr_path = _paired_hdr_path(image_path)
-    metadata = _read_hdr_metadata(hdr_path) if hdr_path else SEMMetadata(None, None, None, None, "", "", "", "")
-
     analyzer = SEMCoverageAnalyzer(config.analyzer)
-    raw = imread(str(image_path))
-    cropped, crop_row = _crop_infobar(raw, analyzer, metadata.image_strip_size_px)
-    norm = analyzer._normalize(cropped)
-    bead_components = _segment_bead_components(analyzer, norm, config.min_bead_area_px)
-    bead_raw_union = np.zeros(cropped.shape, dtype=bool)
-    for component in bead_components:
-        bead_raw_union |= component
-    bead_components = _refine_bead_components(bead_components, config)
+    raw, cropped, norm, display, metadata, crop_row = _load_preprocessed_image(image_path, analyzer, config)
+    try:
+        bead_components = _segment_bead_components(analyzer, norm, config.min_bead_area_px)
+        bead_raw_union = np.zeros(cropped.shape, dtype=bool)
+        for component in bead_components:
+            bead_raw_union |= component
+        try:
+            bead_components = _refine_bead_components(bead_components, config)
+        except SegmentationError:
+            if not config.bead_morph_fallback:
+                raise
+            bead_components = _segment_bead_by_morphology(analyzer, cropped, config)
+    except SegmentationError:
+        if not config.bead_morph_fallback:
+            raise
+        bead_components = _segment_bead_by_morphology(analyzer, cropped, config)
+        bead_raw_union = np.zeros(cropped.shape, dtype=bool)
+        for component in bead_components:
+            bead_raw_union |= component
     bead_refined_union = np.zeros(cropped.shape, dtype=bool)
     for component in bead_components:
         bead_refined_union |= component
-    display = analyzer._scale_for_display(cropped)
-
     roi_results: list[BeadCoverageResult] = []
     ag_count_feature_union = np.zeros(cropped.shape, dtype=np.float32)
     ag_coverage_feature_union = np.zeros(cropped.shape, dtype=np.float32)
@@ -593,9 +760,68 @@ def analyze_coverage_image(image_path: str | Path, config: CoverageViewerConfig)
     )
 
 
-def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig) -> dict:
+def _empty_metadata() -> SEMMetadata:
+    return SEMMetadata(
+        pixel_size_x_m=None,
+        pixel_size_y_m=None,
+        magnification=None,
+        image_strip_size_px=None,
+        view_fields_count_x=None,
+        view_fields_count_y=None,
+        note="",
+        device="",
+        date="",
+        time="",
+    )
+
+
+def _load_preprocessed_image(
+    image_path: str | Path,
+    analyzer: SEMCoverageAnalyzer,
+    config: CoverageViewerConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, SEMMetadata, int]:
+    image_path = Path(image_path)
+    hdr_path = _paired_hdr_path(image_path)
+    metadata = _read_hdr_metadata(hdr_path) if hdr_path else _empty_metadata()
+    raw = imread(str(image_path))
+    cropped, crop_row = _crop_infobar(raw, analyzer, metadata.image_strip_size_px)
+    cropped = _select_detector_view(cropped, metadata, config.detector_choice_index)
+    norm = analyzer._normalize(cropped)
+    display = analyzer._scale_for_display(cropped)
+    return raw, cropped, norm, display, metadata, int(crop_row)
+
+
+def load_failed_image_preview(image_path: str | Path, config: CoverageViewerConfig) -> FailedImagePreview:
+    image_path = Path(image_path)
+    analyzer = SEMCoverageAnalyzer(config.analyzer)
+    _, cropped, norm, display, metadata, crop_row = _load_preprocessed_image(image_path, analyzer, config)
+    return FailedImagePreview(
+        image_path=image_path,
+        cropped=cropped,
+        norm=norm,
+        display=display,
+        metadata=metadata,
+        crop_row=crop_row,
+    )
+
+
+def _resolve_image_paths(folder: str | Path, file: Optional[str] = None) -> list[Path]:
     folder = Path(folder)
-    image_paths = sorted(folder.glob("*.tif"))
+    if file:
+        image_path = Path(file)
+        if not image_path.is_absolute():
+            image_path = folder / image_path
+        if not image_path.exists():
+            raise FileNotFoundError(f"Configured TIFF file not found: '{image_path}'.")
+        if not image_path.is_file():
+            raise FileNotFoundError(f"Configured TIFF path is not a file: '{image_path}'.")
+        return [image_path]
+    return sorted(folder.glob("*.tif"))
+
+
+def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, file: Optional[str] = None) -> dict:
+    folder = Path(folder)
+    image_paths = _resolve_image_paths(folder, file)
     images = []
     failed_images = []
     coverage_vals = []
@@ -680,6 +906,7 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig) -> 
 
     return {
         "folder": str(folder),
+        "file": file,
         "viewer_config": asdict(config),
         "global_summary": {
             "image_count": len(images),
@@ -710,22 +937,24 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig) -> 
     }
 
 
-def write_coverage_summary_json(folder: str | Path, config: CoverageViewerConfig, output_path: str | Path) -> None:
-    summary = build_coverage_summary(folder, config)
+def write_coverage_summary_json(folder: str | Path, config: CoverageViewerConfig, output_path: str | Path, file: Optional[str] = None) -> None:
+    summary = build_coverage_summary(folder, config, file)
     Path(output_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 class CoverageDatasetViewer:
-    def __init__(self, folder: str | Path, config: CoverageViewerConfig):
+    def __init__(self, folder: str | Path, config: CoverageViewerConfig, file: Optional[str] = None):
         self.folder = Path(folder)
+        self.file = file
         self.config = config
-        self.image_paths = sorted(self.folder.glob("*.tif"))
+        self.image_paths = _resolve_image_paths(self.folder, self.file)
         if not self.image_paths:
             raise FileNotFoundError(f"No TIFF files found in '{self.folder}'.")
 
         self.index = 0
         self._cache: dict[Path, CoverageImageResult] = {}
         self._error_cache: dict[Path, str] = {}
+        self._failed_preview_cache: dict[Path, FailedImagePreview] = {}
         self.show_scale = config.default_show_scale
         self.show_bead_boundary = config.default_show_bead_boundary
         self.show_diameter_lines = config.default_show_diameter_lines
@@ -757,6 +986,15 @@ class CoverageDatasetViewer:
     def _get_error(self, index: int) -> Optional[str]:
         return self._error_cache.get(self.image_paths[index])
 
+    def _get_failed_preview(self, index: int) -> Optional[FailedImagePreview]:
+        path = self.image_paths[index]
+        if path not in self._failed_preview_cache:
+            try:
+                self._failed_preview_cache[path] = load_failed_image_preview(path, self.config)
+            except Exception:
+                return None
+        return self._failed_preview_cache[path]
+
     def _scale_feature_image(self, img: np.ndarray) -> np.ndarray:
         vals = img[np.isfinite(img)]
         if vals.size == 0 or float(vals.max()) <= float(vals.min()) + 1e-12:
@@ -780,6 +1018,20 @@ class CoverageDatasetViewer:
         if mode == "ag_coverage_feature":
             return self._scale_feature_image(res.ag_coverage_feature_union)
         return res.display.astype(np.float32)
+
+    def _failed_preview_image(self, preview: FailedImagePreview) -> np.ndarray:
+        mode = self.view_modes[self.view_mode_index]
+        if mode == "norm":
+            base_gray = np.clip(preview.norm.astype(np.float32), 0.0, 1.0)
+        else:
+            base_gray = preview.display.astype(np.float32)
+        return np.dstack([base_gray, base_gray, base_gray]).astype(np.float32)
+
+    def _set_image_data(self, img: np.ndarray) -> None:
+        self.image_artist.set_data(img)
+        h, w = img.shape[:2]
+        self.ax_image.set_xlim(-0.5, w - 0.5)
+        self.ax_image.set_ylim(h - 0.5, -0.5)
 
     def _display_image(self, res: CoverageImageResult) -> np.ndarray:
         base_gray = self._base_gray(res)
@@ -875,6 +1127,8 @@ class CoverageDatasetViewer:
                 "",
                 error or "Unknown analysis error.",
                 "",
+                "Showing cropped detector preview when available.",
+                "",
                 "This frame was skipped during summary generation.",
                 "Tune ROI filters or split thresholds if needed.",
             ]
@@ -921,13 +1175,16 @@ class CoverageDatasetViewer:
         image_path = self.image_paths[self.index]
         res = self._get_result(self.index)
         if res is None:
-            self.image_artist.set_data(np.zeros((512, 512, 3), dtype=np.float32))
-            self.ax_image.set_title(f"{self.index + 1}/{len(self.image_paths)}  {image_path.name}  [{self.view_modes[self.view_mode_index]}]  [failed]", fontsize=11)
+            preview = self._get_failed_preview(self.index)
+            img = self._failed_preview_image(preview) if preview is not None else np.zeros((512, 512, 3), dtype=np.float32)
+            self._set_image_data(img)
+            title_suffix = "failed, showing cropped preview" if preview is not None else "failed"
+            self.ax_image.set_title(f"{self.index + 1}/{len(self.image_paths)}  {image_path.name}  [{self.view_modes[self.view_mode_index]}]  [{title_suffix}]", fontsize=11)
             self._clear_overlays()
             self._update_info(None, image_path, self._get_error(self.index))
             self.fig.canvas.draw_idle()
             return
-        self.image_artist.set_data(self._display_image(res))
+        self._set_image_data(self._display_image(res))
         self.ax_image.set_title(f"{self.index + 1}/{len(self.image_paths)}  {res.image_path.name}  [{self.view_modes[self.view_mode_index]}]", fontsize=11)
         self._clear_overlays()
         if self.show_scale:
@@ -974,7 +1231,11 @@ class CoverageDatasetViewer:
         self.ax_info = self.fig.add_axes([0.70, 0.10, 0.20, 0.72])
         ax_checks = self.fig.add_axes([0.91, 0.10, 0.07, 0.40])
         first = self._get_result(self.index)
-        first_image = self._display_image(first) if first is not None else np.zeros((512, 512, 3), dtype=np.float32)
+        if first is not None:
+            first_image = self._display_image(first)
+        else:
+            first_preview = self._get_failed_preview(self.index)
+            first_image = self._failed_preview_image(first_preview) if first_preview is not None else np.zeros((512, 512, 3), dtype=np.float32)
         self.image_artist = self.ax_image.imshow(first_image, vmin=0.0, vmax=1.0)
         self.ax_image.axis("off")
         self.ax_image.set_autoscale_on(False)
@@ -999,8 +1260,8 @@ def main(config_path: str | Path = "sem_coverage_viewer_config.json") -> None:
         save_default_config(config_path, r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\PVP 10 kDa, 10x AgNPs")
     app_cfg = load_app_config(config_path)
     if app_cfg.summary_json_path:
-        write_coverage_summary_json(app_cfg.folder, app_cfg.viewer, app_cfg.summary_json_path)
-    CoverageDatasetViewer(app_cfg.folder, app_cfg.viewer).show()
+        write_coverage_summary_json(app_cfg.folder, app_cfg.viewer, app_cfg.summary_json_path, app_cfg.file)
+    CoverageDatasetViewer(app_cfg.folder, app_cfg.viewer, app_cfg.file).show()
 
 
 if __name__ == "__main__":
