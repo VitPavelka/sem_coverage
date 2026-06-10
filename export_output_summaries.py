@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-OUTPUTS_DIR = Path(r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\outputs")
+OUTPUTS_DIR = Path(r"/home/vitpavelka/Projects/sem_coverage/testData/outputs2")
 BEAD_CSV_NAME = "bead_global_summaries.csv"
 COVERAGE_CSV_NAME = "coverage_global_summaries.csv"
 BEAD_HISTOGRAM_DIR_NAME = "bead_histograms"

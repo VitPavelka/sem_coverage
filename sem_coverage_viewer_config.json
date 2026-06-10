@@ -1,5 +1,5 @@
 {
-  "folder": "/home/vitpavelka/Projects/sem_coverage/Ag_na_PS_kuličkách",
+  "folder": "/home/vitpavelka/Projects/sem_coverage/testData/130526/data/20",
   "file": null,
   "summary_json_path": null,
   "viewer": {
@@ -52,7 +52,7 @@
     "split_peak_threshold_rel": 0.55,
     "split_max_peaks": 4,
     "split_min_child_area_ratio": 0.18,
-    "ag_enable_secondary_coverage": true,
+    "ag_enable_secondary_coverage": false,
     "ag_coverage_tophat_radius": 15,
     "ag_coverage_tophat_radii": [
       15,
