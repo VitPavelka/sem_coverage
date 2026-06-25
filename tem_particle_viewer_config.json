@@ -1,0 +1,48 @@
+{
+  "folder": "/home/vitpavelka/Projects/sem_coverage/testData/TEM",
+  "file": null,
+  "summary_json_path": null,
+  "viewer": {
+    "strip_rows": null,
+    "footer_tail_rows": 160,
+    "dark_footer_k_mad": 6.0,
+    "dark_footer_min_run": 12,
+    "display_percentiles": [
+      1.0,
+      99.5
+    ],
+    "feature_percentiles": [
+      1.0,
+      99.5
+    ],
+    "pixel_size_nm": null,
+    "fov_nm": 835.0,
+    "detector": "sauvola",
+    "dog_sigma_small": 1.2,
+    "dog_sigma_large": 6.0,
+    "dog_foreground_percentile": 99.0,
+    "intensity_percentile_dark": 35.0,
+    "tophat_radius": 7,
+    "sauvola_window_size": 151,
+    "sauvola_k": 0.20,
+    "closing_radius": 3,
+    "opening_radius": 2,
+    "min_area_px": 500,
+    "max_area_px": null,
+    "max_anisotropy_ratio": 3.0,
+    "min_solidity": 0.2,
+    "split_touching": true,
+    "split_min_distance": 5,
+    "split_threshold_rel": 0.15,
+    "split_exclude_border": false,
+    "measurement_mode": "mask_chords",
+    "measure_step_px": 0.5,
+    "histogram_metric": "mean_axes",
+    "major_axis_color": "cyan",
+    "minor_axis_color": "orange",
+    "default_show_scale": true,
+    "default_show_boundaries": true,
+    "default_show_measures": false,
+    "default_show_histogram": true
+  }
+}

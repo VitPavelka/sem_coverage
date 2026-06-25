@@ -1,0 +1,46 @@
+SEM/TEM PARTICLE ANALYSIS - QUICK START (WINDOWS)
+-------------------------------------------------
+
+OPTION A - DOWNLOAD AND EXTRACT THE DISTRIBUTION .zip file
+1) Install Python 3.13 or 3.14 and select Add Python to PATH
+2) Extract the entire ZIP to a folder of your choice
+3) Open the folder, write "cmd" in the address bar and press enter
+4) Run:
+
+    py -3 -m venv .venv
+    .venv\Scripts\activate
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+
+OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
+1) Install Python 3.13 or 3.14 (select Add Python to PATH) and Git for Windows
+2) Run in the folder you want to install the software:
+
+    git clone https://github.com/VitPavelka/sem_coverage.git
+    cd sem_coverage
+    py -3 -m venv .venv
+    .venv\Scripts\activate
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+
+BEFORE EACH USE
+    .venv\Scripts\activate
+
+EDIT THE APPROPRIATE JSON CONFIG
+Use forward slashes in Windows paths, fe:
+    "folder": "C:/Data/SEM/sample"
+
+RUN A VIEWER
+    python run_bead_viewer.py
+    python run_sem_coverage_viewer.py
+    python run_tem_particle_viewer.py
+
+CHECK AND INSTALL UPDATES
+    git status -sb
+    git fetch origin
+    git pull
+    python -m pip install -r requirements.txt --upgrade
+
+Back up locally edited *_config.json files before pulling updates.
+Left/right arrows change images. The sem coverage viewer also uses up/down arrows for diagnostic layers.
+Full parameter reference and troubleshooting in the README.md file.
