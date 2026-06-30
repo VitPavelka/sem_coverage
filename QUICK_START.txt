@@ -35,6 +35,25 @@ RUN A VIEWER
     python run_sem_coverage_viewer.py
     python run_tem_particle_viewer.py
 
+TUNE SEM PARAMETERS INTERACTIVELY
+    python run_diagnostic_viewer.py --mode beads --config sem_bead_viewer_config.json
+    python run_diagnostic_viewer.py --mode coverage --config sem_coverage_viewer_config.json
+
+Changes remain temporary until Save tuned config (or S) writes a tuned copy.
+Sliders commit on mouse release, and Apply changes commits the current pending
+values explicitly. The diagnostic title/status shows PENDING, RUNNING, or
+UP TO DATE. Left/right changes images, up/down changes diagnostic stages, R
+resets one parameter group, Shift+R resets all parameters, and H displays
+keyboard help.
+Beads mode uses independent dimension-line and measurement-label overlays.
+Coverage mode adds ROI navigation with [ and ] for previous/next ROI and
+\ for All ROIs, plus independent diameter-line and diameter-label overlays.
+Coverage also disables conditionally inactive controls in place, explains why
+they are inactive, uses the multi-radius list instead of the single coverage
+radius when the list is populated, and updates global sphere filters plus
+display contrast without rerunning full segmentation.
+Beads and coverage are currently implemented. TEM diagnostics are planned.
+
 CHECK AND INSTALL UPDATES
     git status -sb
     git fetch origin

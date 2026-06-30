@@ -200,6 +200,73 @@ python run_tem_particle_viewer.py
 Left/right arrows change images. The window shows the original image, detector feature map,
 overlay, and histogram/statistics.
 
+### 4.4 Interactive diagnostic viewer
+
+The unified diagnostic viewer currently supports **SEM bead** and **SEM coverage**
+modes:
+
+```bat
+python run_diagnostic_viewer.py --mode beads --config sem_bead_viewer_config.json
+python run_diagnostic_viewer.py --mode coverage --config sem_coverage_viewer_config.json
+```
+
+Use `--file FILE` to select a specific TIFF, `--folder FOLDER` to temporarily
+override the configured folder, `--output-config PATH` to choose the tuned-copy
+destination, or `--no-async` to debug with synchronous recalculation. Parameter
+changes are temporary and update the image automatically; the source JSON is not
+changed. Click **Save tuned config** or press `S` to write a separate tuned copy
+(`*_tuned.json` by default).
+
+Sliders now update their numeric values while dragging but commit on mouse
+release. The **Apply changes** button commits the current pending values
+explicitly, which is useful after keyboard edits or coordinated multi-control
+changes. The title and status area distinguish `PENDING`, `RUNNING`, and
+`UP TO DATE`.
+
+- Left/Right or the Previous/Next buttons navigate images; Home/End select the first/last image.
+- Up/Down cycles mode-specific diagnostic stages without rerunning analysis.
+- `R` resets the current parameter group; `Shift+R` resets every parameter to the
+  values loaded from the source JSON; `F5` reloads the image list and source config.
+- `H` displays keyboard help. Hover over a parameter control for tuning help.
+
+Beads mode provides stages for the display image, DoG feature, candidate mask,
+labels, valid mask, outlier mask, and overlay. Overlay checkboxes independently
+control valid, rejected, and candidate boundaries, dimension lines, measurement
+labels, and the scale bar.
+
+Coverage mode provides stages for the overlay, display image, normalized image,
+raw/refined bead masks, Ag count and coverage features, Ag count and coverage
+masks, Ag peak map, and ROI index map. Coverage overlay checkboxes independently
+control bead boundaries, ROI inclusion status, diameter lines, diameter labels,
+Ag coverage boundaries, Ag count boundaries, Ag peak markers, ROI index labels,
+and the scale bar.
+
+Coverage mode also supports ROI inspection. Use the Previous ROI, Next ROI, and
+All ROIs buttons or the `[`, `]`, and `\` keys to switch between All ROIs and
+individual bead ROIs. ROI changes update the visualization and status only; they
+do not rerun analysis. Failed coverage segmentations keep the preview image
+visible so the parameters can be tuned until a valid ROI is recovered.
+
+Some coverage controls are conditionally inactive. For example, the single
+coverage top-hat radius is inactive while the multi-radius list is populated,
+adaptive-threshold settings are inactive when adaptive thresholding is disabled,
+and secondary-coverage controls are inactive while the secondary coverage branch
+is disabled. The status/help area explains why a control is inactive.
+
+Coverage global sphere filters update ROI inclusion colors and aggregate
+statistics immediately without rerunning segmentation. Coverage display
+percentiles also update the displayed contrast immediately without starting a
+full analysis.
+
+Select the parameter group on the right to expose the relevant controls. Beads
+currently offers Preprocessing, Detection, Morphology and size, Watershed
+splitting, and Filtering. Coverage offers Preprocessing and display, Primary
+bead segmentation, Morphology fallback, Bead splitting, Ag count detector,
+Ag coverage detector, and Global sphere filters.
+
+TEM diagnostics are still planned but are not implemented in this unified
+diagnostic application yet.
+
 ## 5. Input files and physical calibration
 
 ### 5.1 SEM TIFF and HDR
@@ -279,7 +346,7 @@ Use this when SEM JSON files already exist, and you want to regenerate the CSV/h
 1. Verify footer cropping and physical calibration first.
 2. Tune using at least several representative images, not one ideal image.
 3. Tune coarse segmentation first, touching-object splitting second, and outlier filters last.
-4. Change one parameter group at a time, restart the viewer, and compare overlays. 
+4. Change one parameter group at a time in the diagnostic viewer and compare its live stages and overlays.
 5. Keep a separate configuration for each image type and/or acquisition protocol.
 6. Before batch export, manually review several images from every sample group.
 

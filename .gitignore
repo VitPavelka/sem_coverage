@@ -4,6 +4,7 @@ testData/
 __pycache__/
 .idea/
 .venv
+tests/
 
 IACH_SEM
 Ag_na_PS_kuličkách/
