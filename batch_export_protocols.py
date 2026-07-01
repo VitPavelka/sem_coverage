@@ -20,6 +20,7 @@ except ImportError:
     tqdm = None
 
 from export_output_summaries import export_outputs
+from path_utils import expand_user_path
 from sem_bead_viewer import (
     _format_length_m as bead_format_length_m,
     _format_length_value as bead_format_length_value,
@@ -38,6 +39,7 @@ from sem_coverage_viewer import (
     load_app_config as load_coverage_app_config,
     load_failed_image_preview,
 )
+from tabular_export import sort_paths
 
 
 def _safe_name(name: str) -> str:
@@ -48,7 +50,7 @@ def _safe_name(name: str) -> str:
 def _find_sample_dirs(root: Path) -> list[Path]:
     if not root.exists():
         raise FileNotFoundError(f"Input root does not exist: '{root}'.")
-    sample_dirs = sorted({path.parent for path in root.rglob("*.tif")})
+    sample_dirs = sort_paths(list({path.parent for path in root.rglob("*.tif")}), root=root)
     if not sample_dirs:
         raise FileNotFoundError(f"No TIFF files found under '{root}'.")
     return sample_dirs
@@ -248,7 +250,9 @@ def _export_coverage_png(image_path: Path, config, output_path: Path) -> Path:
     return output_path
 
 
-def _run_bead_batch(root: Path, config_path: Path, outputs_dir: Path) -> list[Path]:
+def _run_bead_batch(
+    root: Path, config_path: Path, outputs_dir: Path, *, sort_by: str = "name"
+) -> list[Path]:
     cfg = load_bead_app_config(config_path)
     written: list[Path] = []
     png_dir = outputs_dir / "size_png"
@@ -260,7 +264,7 @@ def _run_bead_batch(root: Path, config_path: Path, outputs_dir: Path) -> list[Pa
         _write_json(summary, out_path)
         written.append(out_path)
         label = _safe_name(_relative_label(root, sample_dir))
-        for image_path in sorted(sample_dir.glob("*.tif")):
+        for image_path in sort_paths(list(sample_dir.glob("*.tif")), sort_by=sort_by, root=root):
             written.append(_export_bead_png(image_path, cfg.viewer, png_dir / f"{label}__{_safe_name(image_path.stem)}.png"))
             if progress is not None:
                 progress.update(1)
@@ -269,7 +273,9 @@ def _run_bead_batch(root: Path, config_path: Path, outputs_dir: Path) -> list[Pa
     return written
 
 
-def _run_coverage_batch(root: Path, config_path: Path, outputs_dir: Path) -> list[Path]:
+def _run_coverage_batch(
+    root: Path, config_path: Path, outputs_dir: Path, *, sort_by: str = "name"
+) -> list[Path]:
     cfg = load_coverage_app_config(config_path)
     written: list[Path] = []
     png_dir = outputs_dir / "coverage_png"
@@ -281,7 +287,7 @@ def _run_coverage_batch(root: Path, config_path: Path, outputs_dir: Path) -> lis
         _write_json(summary, out_path)
         written.append(out_path)
         label = _safe_name(_relative_label(root, sample_dir))
-        for image_path in sorted(sample_dir.glob("*.tif")):
+        for image_path in sort_paths(list(sample_dir.glob("*.tif")), sort_by=sort_by, root=root):
             written.append(_export_coverage_png(image_path, cfg.viewer, png_dir / f"{label}__{_safe_name(image_path.stem)}.png"))
             if progress is not None:
                 progress.update(1)
@@ -297,6 +303,8 @@ def _remove_outputs(outputs_dir: Path) -> None:
         path.unlink()
     for path in outputs_dir.glob("*.csv"):
         path.unlink()
+    for path in outputs_dir.glob("*.xlsx"):
+        path.unlink()
     hist_dir = outputs_dir / "bead_histograms"
     if hist_dir.exists():
         for path in hist_dir.glob("*.png"):
@@ -309,7 +317,7 @@ def _remove_outputs(outputs_dir: Path) -> None:
 
 
 def _print_paths(paths: Iterable[Path]) -> None:
-    for path in paths:
+    for path in sort_paths(list(paths), sort_by="path"):
         print(path)
 
 
@@ -319,7 +327,7 @@ def _progress(*, desc: str, total: int):
     return tqdm(desc=desc, total=total, unit="image")
 
 
-def _parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Batch-run SEM bead and coverage summaries for all TIFF-containing subfolders, then export CSV summaries."
     )
@@ -345,26 +353,66 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--clean", action="store_true", help="Remove existing JSON/CSV/PNG outputs in outputs-dir before running.")
     parser.add_argument("--no-export", action="store_true", help="Only write per-sample JSON summaries, skip CSV/histogram export.")
-    return parser.parse_args()
+    parser.add_argument("--no-csv", action="store_true", help="Do not write SEM CSV summary files.")
+    parser.add_argument("--no-bead-csv", action="store_true", help="Do not write bead_global_summaries.csv.")
+    parser.add_argument("--no-coverage-csv", action="store_true", help="Do not write coverage_global_summaries.csv.")
+    parser.add_argument("--no-histograms", action="store_true", help="Do not write bead histogram PNG files.")
+    parser.add_argument(
+        "--table-format",
+        choices=("csv", "xlsx", "both", "none"),
+        default="csv",
+        help="Summary table export format. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--sort-by",
+        choices=("name", "path", "none"),
+        default="name",
+        help="Deterministic natural sorting for samples, TIFFs, and summary tables. Default: %(default)s",
+    )
+    return parser
 
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     if not args.bead_root and not args.coverage_root:
         raise SystemExit("At least one of --bead-root or --coverage-root must be provided.")
 
-    outputs_dir = args.outputs_dir
+    outputs_dir = expand_user_path(args.outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
     if args.clean:
         _remove_outputs(outputs_dir)
 
     written: list[Path] = []
     if args.bead_root:
-        written.extend(_run_bead_batch(args.bead_root, args.bead_config, outputs_dir))
+        written.extend(
+            _run_bead_batch(
+                expand_user_path(args.bead_root),
+                expand_user_path(args.bead_config),
+                outputs_dir,
+                sort_by=args.sort_by,
+            )
+        )
     if args.coverage_root:
-        written.extend(_run_coverage_batch(args.coverage_root, args.coverage_config, outputs_dir))
+        written.extend(
+            _run_coverage_batch(
+                expand_user_path(args.coverage_root),
+                expand_user_path(args.coverage_config),
+                outputs_dir,
+                sort_by=args.sort_by,
+            )
+        )
     if not args.no_export:
-        written.extend(export_outputs(outputs_dir))
+        written.extend(
+            export_outputs(
+                outputs_dir,
+                csv=not args.no_csv,
+                bead_csv=not args.no_bead_csv,
+                coverage_csv=not args.no_coverage_csv,
+                histograms=not args.no_histograms,
+                table_format=args.table_format,
+                sort_by=args.sort_by,
+            )
+        )
 
     _print_paths(written)
 

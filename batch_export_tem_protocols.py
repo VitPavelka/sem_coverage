@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +16,8 @@ try:
 except ImportError:
     tqdm = None
 
+from path_utils import expand_user_path, resolve_optional_file_in_folder
+from tabular_export import natural_sort_key, sort_paths, sort_rows, write_csv_table, write_xlsx_workbook
 from tem_particle_viewer import (
     TEMAnalysisResult,
     _make_measure_overlay,
@@ -35,6 +36,7 @@ from tem_particle_viewer import (
 
 TEM_GLOBAL_CSV_NAME = "tem_global_summaries.csv"
 TEM_IMAGE_CSV_NAME = "tem_image_summaries.csv"
+TEM_WORKBOOK_NAME = "tem_summaries.xlsx"
 TEM_HISTOGRAM_DIR_NAME = "tem_histograms"
 
 
@@ -66,16 +68,25 @@ def _discover_source_images(root: Path, outputs_dir: Path) -> list[Path]:
     }
     paths = _resolve_image_paths(root, exclude_dirs=exclude_dirs)
     outputs_dir_resolved = outputs_dir.resolve()
-    return [path for path in paths if not _is_within(path.resolve(), outputs_dir_resolved)]
+    return sort_paths(
+        [path for path in paths if not _is_within(path.resolve(), outputs_dir_resolved)],
+        root=root,
+    )
 
 
-def _group_images_by_sample(root: Path, image_paths: list[Path]) -> list[tuple[Path, list[Path]]]:
+def _group_images_by_sample(
+    root: Path, image_paths: list[Path], *, sort_by: str = "name"
+) -> list[tuple[Path, list[Path]]]:
     grouped: dict[Path, list[Path]] = {}
     root = root.resolve()
     for path in image_paths:
         sample_dir = path.parent.resolve()
         grouped.setdefault(sample_dir, []).append(path)
-    return [(sample_dir, sorted(paths)) for sample_dir, paths in sorted(grouped.items(), key=lambda item: item[0].as_posix())]
+    sample_dirs = sort_paths(list(grouped), sort_by=sort_by, root=root)
+    return [
+        (sample_dir, sort_paths(grouped[sample_dir], sort_by=sort_by, root=root))
+        for sample_dir in sample_dirs
+    ]
 
 
 def _sample_label(root: Path, sample_dir: Path) -> str:
@@ -162,19 +173,6 @@ def _per_image_json(res: TEMAnalysisResult) -> dict:
         "sd_eq_diameter_nm": _safe_float(float(np.std(valid_eq_nm, ddof=1))) if len(valid_eq_nm) > 1 else 0.0 if valid_eq_nm else None,
         "particles": _measurements_to_dicts(res.measurements),
     }
-
-
-def _write_csv(rows: list[dict], path: Path) -> Path | None:
-    if not rows:
-        return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    return path
 
 
 def _global_summary_row(global_summary: dict, source_name: str, json_file: str) -> dict:
@@ -270,14 +268,48 @@ def _plot_histogram(values: np.ndarray, xlabel: str, title: str, output_path: Pa
     return output_path
 
 
-def _export_csv_summaries(summary_rows: list[dict], image_rows: list[dict], outputs_dir: Path) -> list[Path]:
+def _export_tables(
+    summary_rows: list[dict],
+    image_rows: list[dict],
+    outputs_dir: Path,
+    *,
+    table_format: str,
+    csv_enabled: bool,
+    sort_by: str,
+) -> list[Path]:
     written: list[Path] = []
-    global_csv = _write_csv(summary_rows, outputs_dir / TEM_GLOBAL_CSV_NAME)
-    if global_csv is not None:
-        written.append(global_csv)
-    image_csv = _write_csv(image_rows, outputs_dir / TEM_IMAGE_CSV_NAME)
-    if image_csv is not None:
-        written.append(image_csv)
+    if table_format in {"csv", "both"} and csv_enabled:
+        global_csv = write_csv_table(
+            summary_rows,
+            outputs_dir / TEM_GLOBAL_CSV_NAME,
+            preferred_columns=("name", "json_file"),
+            sort_by=sort_by,
+        )
+        if global_csv is not None:
+            written.append(global_csv)
+        image_csv = write_csv_table(
+            image_rows,
+            outputs_dir / TEM_IMAGE_CSV_NAME,
+            preferred_columns=("sample", "file", "status"),
+            sort_by=sort_by,
+        )
+        if image_csv is not None:
+            written.append(image_csv)
+    if table_format in {"xlsx", "both"}:
+        workbook = write_xlsx_workbook(
+            {
+                "Samples": summary_rows,
+                "Images": image_rows,
+            },
+            outputs_dir / TEM_WORKBOOK_NAME,
+            preferred_columns={
+                "Samples": ("name", "json_file"),
+                "Images": ("sample", "file", "status"),
+            },
+            sort_by=sort_by,
+        )
+        if workbook is not None:
+            written.append(workbook)
     return written
 
 
@@ -321,6 +353,8 @@ def _remove_outputs(outputs_dir: Path) -> None:
         path.unlink()
     for path in outputs_dir.glob("*.csv"):
         path.unlink()
+    for path in outputs_dir.glob("*.xlsx"):
+        path.unlink()
     for subdir in ("tem_png", "tem_json"):
         target = outputs_dir / subdir
         if target.exists():
@@ -334,7 +368,7 @@ def _remove_outputs(outputs_dir: Path) -> None:
 
 
 def _print_paths(paths: Iterable[Path]) -> None:
-    for path in paths:
+    for path in sort_paths(list(paths), sort_by="path"):
         print(path)
 
 
@@ -344,7 +378,7 @@ def _progress(desc: str, total: int):
     return tqdm(desc=desc, total=total, unit="image")
 
 
-def _parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch-run TEM particle sizing export for PNG/JPG images.")
     parser.add_argument("--root", type=Path, required=True, help="TEM image folder.")
     parser.add_argument(
@@ -362,24 +396,37 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clean", action="store_true", help="Remove existing TEM outputs in outputs-dir before running.")
     parser.add_argument("--no-csv", action="store_true", help="Do not write TEM CSV summary files.")
     parser.add_argument("--no-histograms", action="store_true", help="Do not write TEM histogram PNG files.")
-    return parser.parse_args()
+    parser.add_argument(
+        "--table-format",
+        choices=("csv", "xlsx", "both", "none"),
+        default="csv",
+        help="Summary table export format. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--sort-by",
+        choices=("name", "path", "none"),
+        default="name",
+        help="Deterministic natural sorting for samples, images, and rows. Default: %(default)s",
+    )
+    return parser
 
 
-def main() -> None:
-    args = _parse_args()
-    app_cfg = load_app_config(args.config)
-    outputs_dir = args.outputs_dir
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    app_cfg = load_app_config(expand_user_path(args.config))
+    outputs_dir = expand_user_path(args.outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
     if args.clean:
         _remove_outputs(outputs_dir)
 
-    image_paths = _discover_source_images(args.root, outputs_dir)
+    root = expand_user_path(args.root)
+    image_paths = _discover_source_images(root, outputs_dir)
     if app_cfg.file:
-        requested = (Path(app_cfg.folder) / app_cfg.file).resolve()
+        requested = resolve_optional_file_in_folder(root, app_cfg.file).resolve()
         image_paths = [path for path in image_paths if path.resolve() == requested]
         if not image_paths:
-            raise FileNotFoundError(f"Requested TEM file was not found under root '{args.root}': '{requested}'.")
-    sample_groups = _group_images_by_sample(args.root, image_paths)
+            raise FileNotFoundError(f"Requested TEM file was not found under root '{root}': '{requested}'.")
+    sample_groups = _group_images_by_sample(root, image_paths, sort_by=args.sort_by)
     png_dir = outputs_dir / "tem_png"
     json_dir = outputs_dir / "tem_json"
     written: list[Path] = []
@@ -389,7 +436,7 @@ def main() -> None:
     sample_summaries: list[tuple[str, dict]] = []
 
     for sample_dir, sample_paths in sample_groups:
-        sample_label = _sample_label(args.root, sample_dir)
+        sample_label = _sample_label(root, sample_dir)
         sample_summary = build_tem_summary_from_paths(sample_paths, app_cfg.viewer, sample_dir)
         sample_summary["file"] = app_cfg.file if len(sample_paths) == 1 and app_cfg.file else None
         sample_summary_path = outputs_dir / f"{_safe_name(sample_label)}__tem_summary.json"
@@ -430,13 +477,22 @@ def main() -> None:
     if progress is not None:
         progress.close()
 
-    global_summary = build_tem_summary_from_paths(image_paths, app_cfg.viewer, args.root)
+    global_summary = build_tem_summary_from_paths(image_paths, app_cfg.viewer, root)
     global_summary["file"] = app_cfg.file
     global_path = outputs_dir / "tem_global_summary.json"
     _write_json(global_summary, global_path)
     written.append(global_path)
-    if not args.no_csv:
-        written.extend(_export_csv_summaries(sample_summary_rows, image_csv_rows, outputs_dir))
+    if args.table_format != "none":
+        written.extend(
+            _export_tables(
+                sample_summary_rows,
+                image_csv_rows,
+                outputs_dir,
+                table_format=args.table_format,
+                csv_enabled=not args.no_csv,
+                sort_by=args.sort_by,
+            )
+        )
     if not args.no_histograms:
         written.extend(_export_histograms(sample_summaries, outputs_dir, app_cfg.viewer.histogram_metric))
     _print_paths(written)

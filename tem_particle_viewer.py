@@ -22,6 +22,14 @@ from skimage.measure import label, regionprops
 from skimage.morphology import closing, disk, opening, remove_small_objects, white_tophat
 from skimage.segmentation import find_boundaries, watershed
 
+from path_utils import (
+    expand_user_path,
+    path_to_config_text,
+    resolve_existing_input_path,
+    resolve_optional_file_in_folder,
+)
+from tabular_export import sort_paths
+
 
 log = logging.getLogger(__name__)
 
@@ -181,8 +189,10 @@ def load_app_config(config_path: str | Path) -> AppConfig:
 def save_default_config(config_path: str | Path, folder: str | Path) -> None:
     """Write a default TEM viewer config JSON next to the runner."""
     config = AppConfig(
-        folder=str(folder),
-        summary_json_path=str(Path(folder).resolve() / "tem_particle_summary.json"),
+        folder=path_to_config_text(folder),
+        summary_json_path=path_to_config_text(
+            Path(folder).resolve() / "tem_particle_summary.json"
+        ),
     )
     Path(config_path).write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
@@ -200,11 +210,11 @@ def _resolve_image_paths(folder: str | Path, file: Optional[str] = None, exclude
     folder_path = Path(folder)
     exclude_dirs = exclude_dirs or set()
     if file:
-        path = folder_path / file
+        path = resolve_optional_file_in_folder(folder_path, file)
         if not path.exists():
             raise FileNotFoundError(f"Requested file does not exist: '{path}'.")
         return [path]
-    paths = sorted(
+    paths = sort_paths(
         [
             *folder_path.glob("*.png"),
             *folder_path.glob("*.PNG"),
@@ -215,7 +225,7 @@ def _resolve_image_paths(folder: str | Path, file: Optional[str] = None, exclude
         ]
     )
     if not paths:
-        paths = sorted(
+        paths = sort_paths(
             [
                 *folder_path.rglob("*.png"),
                 *folder_path.rglob("*.PNG"),
@@ -1180,14 +1190,53 @@ def smoke_test_examples() -> dict[str, int]:
 
 def main(config_path: str | Path = "tem_particle_viewer_config.json") -> None:
     """Run TEM summary export or open the interactive TEM viewer."""
-    config_path = Path(config_path)
+    run_from_config(config_path)
+
+
+DEFAULT_CONFIG_PATH = Path("tem_particle_viewer_config.json")
+
+
+def run_from_config(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    folder_override: str | Path | None = None,
+    file_override: str | Path | None = None,
+) -> None:
+    """Run the TEM viewer from one config file and temporary CLI overrides."""
+
+    config_path = expand_user_path(config_path)
     if not config_path.exists():
         save_default_config(config_path, Path(__file__).resolve().parent / "testData" / "TEM")
     app_cfg = load_app_config(config_path)
+    effective_folder = (
+        expand_user_path(folder_override)
+        if folder_override is not None
+        else resolve_existing_input_path(
+            app_cfg.folder, config_path=config_path, description="image folder"
+        )
+    )
+    effective_file = (
+        resolve_optional_file_in_folder(effective_folder, file_override)
+        if file_override is not None
+        else (
+            resolve_optional_file_in_folder(effective_folder, app_cfg.file)
+            if app_cfg.file
+            else None
+        )
+    )
     if app_cfg.summary_json_path:
-        write_tem_summary_json(app_cfg.folder, app_cfg.viewer, app_cfg.summary_json_path, app_cfg.file)
+        write_tem_summary_json(
+            effective_folder,
+            app_cfg.viewer,
+            expand_user_path(app_cfg.summary_json_path),
+            None if effective_file is None else str(effective_file),
+        )
     else:
-        TEMDatasetViewer(app_cfg.folder, app_cfg.viewer, app_cfg.file).show()
+        TEMDatasetViewer(
+            effective_folder,
+            app_cfg.viewer,
+            None if effective_file is None else str(effective_file),
+        ).show()
 
 
 if __name__ == "__main__":

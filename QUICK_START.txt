@@ -1,21 +1,18 @@
 SEM/TEM PARTICLE ANALYSIS - QUICK START (WINDOWS)
 -------------------------------------------------
 
-OPTION A - DOWNLOAD AND EXTRACT THE DISTRIBUTION .zip file
-1) Install Python 3.13 or 3.14 and select Add Python to PATH
-2) Extract the entire ZIP to a folder of your choice
-3) Open the folder, write "cmd" in the address bar and press enter
-4) Run:
+1) INSTALL PYTHON, CREATE THE ENVIRONMENT, AND INSTALL DEPENDENCIES
+OPTION A - DOWNLOAD AND EXTRACT THE DISTRIBUTION ZIP
+    Install Python 3.13 or 3.14 and select Add Python to PATH
+    Extract the ZIP to a writable folder
+    Open that folder, type "cmd" in the address bar, and run:
 
-    py -3 -m venv .venv
-    .venv\Scripts\activate
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
+        py -3 -m venv .venv
+        .venv\Scripts\activate
+        python -m pip install --upgrade pip
+        python -m pip install -r requirements.txt
 
 OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
-1) Install Python 3.13 or 3.14 (select Add Python to PATH) and Git for Windows
-2) Run in the folder you want to install the software:
-
     git clone https://github.com/VitPavelka/sem_coverage.git
     cd sem_coverage
     py -3 -m venv .venv
@@ -23,43 +20,61 @@ OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
     python -m pip install --upgrade pip
     python -m pip install -r requirements.txt
 
-BEFORE EACH USE
+2) ACTIVATE THE ENVIRONMENT BEFORE EACH USE
     .venv\Scripts\activate
 
-EDIT THE APPROPRIATE JSON CONFIG
-Use forward slashes in Windows paths, fe:
-    "folder": "C:/Data/SEM/sample"
+3) CHOOSE THE CONFIG AND PATHS
+    Use forward slashes in JSON where practical, for example:
 
-RUN A VIEWER
-    python run_bead_viewer.py
-    python run_sem_coverage_viewer.py
-    python run_tem_particle_viewer.py
+        "folder": "C:/Data/SEM/sample_01"
 
-TUNE SEM PARAMETERS INTERACTIVELY
+    A single unescaped backslash is not valid JSON.
+    Use CLI overrides instead of editing long paths when convenient:
+
+        python run_bead_viewer.py --help
+        python run_sem_coverage_viewer.py --help
+        python run_tem_particle_viewer.py --help
+
+4) TUNE WITH THE DIAGNOSTIC VIEWER FIRST
     python run_diagnostic_viewer.py --mode beads --config sem_bead_viewer_config.json
     python run_diagnostic_viewer.py --mode coverage --config sem_coverage_viewer_config.json
 
-Changes remain temporary until Save tuned config (or S) writes a tuned copy.
-Sliders commit on mouse release, and Apply changes commits the current pending
-values explicitly. The diagnostic title/status shows PENDING, RUNNING, or
-UP TO DATE. Left/right changes images, up/down changes diagnostic stages, R
-resets one parameter group, Shift+R resets all parameters, and H displays
-keyboard help.
-Beads mode uses independent dimension-line and measurement-label overlays.
-Coverage mode adds ROI navigation with [ and ] for previous/next ROI and
-\ for All ROIs, plus independent diameter-line and diameter-label overlays.
-Coverage also disables conditionally inactive controls in place, explains why
-they are inactive, uses the multi-radius list instead of the single coverage
-radius when the list is populated, and updates global sphere filters plus
-display contrast without rerunning full segmentation.
-Beads and coverage are currently implemented. TEM diagnostics are planned.
+    Sliders commit on mouse release.
+    Apply changes commits the current pending values explicitly.
+    The title and status area show PENDING, RUNNING, or UP TO DATE.
+    Coverage mode also disables conditionally inactive controls in place and
+    explains why they are inactive.
+    Beads and coverage are currently implemented. TEM diagnostics are planned.
 
-CHECK AND INSTALL UPDATES
+5) VERIFY THE TUNED SETTINGS IN THE REGULAR VIEWERS
+    python run_bead_viewer.py
+    python run_bead_viewer.py --config sem_bead_viewer_config.json
+
+    python run_sem_coverage_viewer.py
+    python run_sem_coverage_viewer.py --config sem_coverage_viewer_config.json --folder "C:/Data/SEM coverage"
+
+    python run_tem_particle_viewer.py
+    python run_tem_particle_viewer.py --config tem_particle_viewer_config.json --file "TEM SeNPs 1.png"
+
+    CLI overrides do not modify the source JSON config.
+    Regular viewers may optionally create summary JSON files when configured,
+    but final CSV/XLSX tables belong to the batch/export layer.
+
+6) RUN BATCH EXPORTS FOR FINAL OUTPUTS
+    python batch_export_protocols.py --bead-root "C:/Data/SEM beads" --outputs-dir outputs --table-format both
+    python batch_export_tem_protocols.py --root "C:/Data/TEM" --outputs-dir outputs_tem --table-format xlsx
+    python export_output_summaries.py --outputs-dir outputs --table-format both
+
+    --table-format csv   keeps the current CSV behavior
+    --table-format xlsx  writes only Excel workbooks
+    --table-format both  writes both CSV and XLSX
+    --table-format none  writes no summary tables
+
+7) UPDATE THE REPOSITORY SAFELY
     git status -sb
     git fetch origin
-    git pull
+    git pull --ff-only
     python -m pip install -r requirements.txt --upgrade
 
-Back up locally edited *_config.json files before pulling updates.
-Left/right arrows change images. The sem coverage viewer also uses up/down arrows for diagnostic layers.
-Full parameter reference and troubleshooting in the README.md file.
+    Back up locally edited *_config.json files before pulling updates.
+    Full parameter reference and troubleshooting are in README.md.

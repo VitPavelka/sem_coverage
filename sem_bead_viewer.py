@@ -22,6 +22,9 @@ from skimage.morphology import closing, disk, opening, remove_small_objects
 from skimage.segmentation import find_boundaries, watershed
 from tifffile import imread
 
+from path_utils import expand_user_path, path_to_config_text, resolve_existing_input_path
+from tabular_export import sort_paths
+
 
 @dataclass(frozen=True)
 class ViewerConfig:
@@ -179,8 +182,10 @@ def load_app_config(config_path: str | Path) -> AppConfig:
 
 def save_default_config(config_path: str | Path, folder: str | Path) -> None:
     config = AppConfig(
-        folder=str(folder),
-        summary_json_path=str(Path(folder).resolve() / "sem_bead_viewer_summary.json"),
+        folder=path_to_config_text(folder),
+        summary_json_path=path_to_config_text(
+            Path(folder).resolve() / "sem_bead_viewer_summary.json"
+        ),
     )
     Path(config_path).write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
@@ -547,7 +552,7 @@ class BeadDatasetViewer:
     def __init__(self, folder: str | Path, config: ViewerConfig = ViewerConfig()):
         self.folder = Path(folder)
         self.config = config
-        self.image_paths = sorted(self.folder.glob("*.tif"))
+        self.image_paths = sort_paths(list(self.folder.glob("*.tif")))
         if not self.image_paths:
             raise FileNotFoundError(f"No TIFF files found in '{self.folder}'.")
 
@@ -816,7 +821,7 @@ class BeadDatasetViewer:
 
 def build_bead_summary(folder: str | Path, config: ViewerConfig) -> dict:
     folder = Path(folder)
-    image_paths = sorted(folder.glob("*.tif"))
+    image_paths = sort_paths(list(folder.glob("*.tif")))
     images = []
     global_vals = []
 
@@ -876,17 +881,39 @@ def write_bead_summary_json(folder: str | Path, config: ViewerConfig, output_pat
     Path(output_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
-def main(config_path: str | Path = "sem_bead_viewer_config.json") -> None:
-    config_path = Path(config_path)
+DEFAULT_CONFIG_PATH = Path("sem_bead_viewer_config.json")
+
+
+def run_from_config(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    folder_override: str | Path | None = None,
+) -> None:
+    """Run the bead viewer from one config file and temporary CLI overrides."""
+
+    config_path = expand_user_path(config_path)
     if not config_path.exists():
         save_default_config(
             config_path,
             r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\10 kDa, bare",
         )
     app_cfg = load_app_config(config_path)
+    effective_folder = (
+        expand_user_path(folder_override)
+        if folder_override is not None
+        else resolve_existing_input_path(
+            app_cfg.folder, config_path=config_path, description="image folder"
+        )
+    )
     if app_cfg.summary_json_path:
-        write_bead_summary_json(app_cfg.folder, app_cfg.viewer, app_cfg.summary_json_path)
-    BeadDatasetViewer(app_cfg.folder, app_cfg.viewer).show()
+        write_bead_summary_json(
+            effective_folder, app_cfg.viewer, expand_user_path(app_cfg.summary_json_path)
+        )
+    BeadDatasetViewer(effective_folder, app_cfg.viewer).show()
+
+
+def main(config_path: str | Path = "sem_bead_viewer_config.json") -> None:
+    run_from_config(config_path)
 
 
 if __name__ == "__main__":

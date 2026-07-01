@@ -22,7 +22,14 @@ from skimage.segmentation import clear_border, find_boundaries, watershed
 from skimage.transform import resize, rescale
 from tifffile import imread
 
+from path_utils import (
+    expand_user_path,
+    path_to_config_text,
+    resolve_existing_input_path,
+    resolve_optional_file_in_folder,
+)
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
+from tabular_export import sort_paths
 
 
 @dataclass(frozen=True)
@@ -213,9 +220,11 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
 
 def save_default_config(config_path: str | Path, folder: str | Path) -> None:
     config = CoverageAppConfig(
-        folder=str(folder),
+        folder=path_to_config_text(folder),
         file=None,
-        summary_json_path=str(Path(folder).resolve() / "sem_coverage_viewer_summary.json"),
+        summary_json_path=path_to_config_text(
+            Path(folder).resolve() / "sem_coverage_viewer_summary.json"
+        ),
     )
     Path(config_path).write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
 
@@ -808,15 +817,13 @@ def load_failed_image_preview(image_path: str | Path, config: CoverageViewerConf
 def _resolve_image_paths(folder: str | Path, file: Optional[str] = None) -> list[Path]:
     folder = Path(folder)
     if file:
-        image_path = Path(file)
-        if not image_path.is_absolute():
-            image_path = folder / image_path
+        image_path = resolve_optional_file_in_folder(folder, file)
         if not image_path.exists():
             raise FileNotFoundError(f"Configured TIFF file not found: '{image_path}'.")
         if not image_path.is_file():
             raise FileNotFoundError(f"Configured TIFF path is not a file: '{image_path}'.")
         return [image_path]
-    return sorted(folder.glob("*.tif"))
+    return sort_paths(list(folder.glob("*.tif")))
 
 
 def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, file: Optional[str] = None) -> dict:
@@ -1255,13 +1262,55 @@ class CoverageDatasetViewer:
 
 
 def main(config_path: str | Path = "sem_coverage_viewer_config.json") -> None:
-    config_path = Path(config_path)
+    run_from_config(config_path)
+
+
+DEFAULT_CONFIG_PATH = Path("sem_coverage_viewer_config.json")
+
+
+def run_from_config(
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    folder_override: str | Path | None = None,
+    file_override: str | Path | None = None,
+) -> None:
+    """Run the SEM coverage viewer from one config file and temporary overrides."""
+
+    config_path = expand_user_path(config_path)
     if not config_path.exists():
-        save_default_config(config_path, r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\PVP 10 kDa, 10x AgNPs")
+        save_default_config(
+            config_path,
+            r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\PVP 10 kDa, 10x AgNPs",
+        )
     app_cfg = load_app_config(config_path)
+    effective_folder = (
+        expand_user_path(folder_override)
+        if folder_override is not None
+        else resolve_existing_input_path(
+            app_cfg.folder, config_path=config_path, description="image folder"
+        )
+    )
+    effective_file = (
+        resolve_optional_file_in_folder(effective_folder, file_override)
+        if file_override is not None
+        else (
+            resolve_optional_file_in_folder(effective_folder, app_cfg.file)
+            if app_cfg.file
+            else None
+        )
+    )
     if app_cfg.summary_json_path:
-        write_coverage_summary_json(app_cfg.folder, app_cfg.viewer, app_cfg.summary_json_path, app_cfg.file)
-    CoverageDatasetViewer(app_cfg.folder, app_cfg.viewer, app_cfg.file).show()
+        write_coverage_summary_json(
+            effective_folder,
+            app_cfg.viewer,
+            expand_user_path(app_cfg.summary_json_path),
+            None if effective_file is None else str(effective_file),
+        )
+    CoverageDatasetViewer(
+        effective_folder,
+        app_cfg.viewer,
+        None if effective_file is None else str(effective_file),
+    ).show()
 
 
 if __name__ == "__main__":

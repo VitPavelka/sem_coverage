@@ -5,9 +5,9 @@
 **Repository:** `https://github.com/VitPavelka/sem_coverage`
 **Default Git branch:** `master`
 
-This manual is intended for users with little or no Python experience. 
-It covers installation, updates, interactive viewers, batch export, 
-every current configuration parameter, and some troubleshooting.
+This manual is intended for users with little or no Python experience.
+It covers installation, updates, interactive viewers, batch export,
+every current configuration parameter, and troubleshooting.
 
 **Important:** This software is still under development. 
 Every result is an automated image-analysis *estimate*.
@@ -19,14 +19,15 @@ At first, try to keep separate configuration presets for different acquisition p
 
 | Task                                           | Launcher                        | Configuration                     | Input                                   |
 |------------------------------------------------|---------------------------------|-----------------------------------|-----------------------------------------|
+| Unified interactive diagnostic tuning          | `run_diagnostic_viewer.py`      | `sem_bead_viewer_config.json` or `sem_coverage_viewer_config.json` | SEM `.tif` plus optional paired `.hdr`; modes `beads` and `coverage`; temporary tuning only; TEM diagnostics are not implemented yet |
 | Size analysis of bright SEM beads              | `run_bead_viewer.py`            | `sem_bead_viewer_config.json`     | `.tif` plus optional paired `.hdr`      |
 | Ag coverage and Ag-count estimate on SEM beads | `run_sem_coverage_viewer.py`    | `sem_coverage_viewer_config.json` | `.tif` plus optional paired `.hdr`      |
 | Size analysis of dark TEM nanoparticles        | `run_tem_particle_viewer.py`    | `tem_particle_viewer_config.json` | `.png`, `.jpg`, `.jpeg`                 |
 | Batch SEM export                               | `batch_export_protocols.py`     | the two SEM configs as templates  | directory tree containing `.tif` files  |
 | Batch TEM export                               | `batch_export_tem_protocols.py` | TEM config as a template          | directory tree containing PNG/JPG files |
-| Additional SEM CSV/histogram export            | `export_output_summaries.py`    | command-line arguments            | previously generated SEM JSON files     |
+| Additional SEM summary re-export               | `export_output_summaries.py`    | command-line arguments            | previously generated SEM JSON files     |
 
-## 2. Installation
+## 2. Installation and updates
 
 ### 2.1 Easiest one-time installation from a ZIP archive
 
@@ -127,7 +128,7 @@ This project is (and will be for some time) under construction.
 Any developers are more than welcome to contribute:
     If this is you, please create a separate branch before changing code and contact me (`pavelka.vit69@gmail.com`).
 
-## 3. Editing JSON configuration files
+## 3. Configuration files and path handling
 
 Open the JSON files in Notepad, Notepad++, or VS Code.
 Routine users normally change only paths and values under `viewer`.
@@ -140,14 +141,16 @@ Routine users normally change only paths and values under `viewer`.
 - Do not place a comma after the final item in an object.
 - JSON does not support comments.
 - On Windows, prefer `/`: `"C:/Data/TEM"`. Alternatively, escape backslashes: `"C:\\Data\\TEM"`.
+- A single unescaped backslash is not valid JSON. For example, `"C:\Data\SEM"` is invalid JSON.
+- If editing long Windows paths in JSON is inconvenient, use CLI `--folder` or `--file` overrides instead.
 
 ### Common top-level fields
 
 | Field               | Meaning                                                                                          | Recommendation                                                        |
 |---------------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
-| `folder`            | Folder containing input images.                                                                  | The past must exist.                                                  |
+| `folder`            | Folder containing input images.                                                                  | The path must exist.                                                  |
 | `file`              | Optional single file in SEM coverage and TEM configurations (`null` means all supported images). | Enter a file name or path. SEM bead viewer has no `file` field.       |
-| `summary_json_path` | Optional path for a summary JSON. `null` is the simplest interactive mode.                       | Routine users should noramlly leave it `null` and use batch scripts.  |
+| `summary_json_path` | Optional path for a summary JSON. `null` is the simplest interactive mode.                       | Routine users should normally leave it `null` and use batch scripts.  |
 
 Example:
 
@@ -162,48 +165,32 @@ Example:
 }
 ```
 
-## 4. Running the interactive viewers
+Relative config input paths keep the current legacy behavior:
+
+1. absolute paths are used directly;
+2. a relative input path first tries the current working directory;
+3. if that path does not exist, the same relative path is tried next to the config file.
+
+This keeps existing working-directory-based setups working while allowing more portable configs.
+
+For `file` fields, an absolute file path is used directly. A relative file path is resolved inside the effective `folder`.
+
+## 4. Recommended workflow
+
+1. **Diagnostic viewer**
+   Tune and understand parameters on representative images.
+2. **Regular viewer**
+   Verify the tuned configuration on several images without the full diagnostic control panel.
+3. **Batch export**
+   Process complete folders and generate final JSON, PNG, CSV, and/or XLSX outputs.
+4. **Optional SEM summary re-export**
+   If SEM JSON outputs already exist, regenerate CSV/XLSX tables or histograms later with `export_output_summaries.py`.
+
+## 5. Interactive diagnostic viewer
 
 Run commands from the project folder while `.venv` is active.
 
-### 4.1 SEM bead size
-
-```bat
-python run_bead_viewer.py
-```
-
-The viewer loads lowercase **`.tif`** files directly inside `folder`.
-Left/right arrows change images.
-Checkboxes control the scale bar, boundaries, and size labels.
-
-### 4.2 SEM Ag coverage
-
-```bat
-python run_sem_coverage_viewer.py
-```
-
-Left/right arrows change images. Up/down arrows switch diagnostic layers:
-
-- `display` - original image scaled for display,
-- `norm` - normalization used for bead detection,
-- `bead_raw` - initial ROI candidates,
-- `bead_refined` - final bead ROIs,
-- `ag_count_feature` - top-hat response used for Ag peaks,
-- `ag_coverage_feature` - response used for the coverage mask.
-
-### 4.3 TEM particle size
-
-```bat
-python run_tem_particle_viewer.py
-```
-
-Left/right arrows change images. The window shows the original image, detector feature map,
-overlay, and histogram/statistics.
-
-### 4.4 Interactive diagnostic viewer
-
-The unified diagnostic viewer currently supports **SEM bead** and **SEM coverage**
-modes:
+The unified diagnostic viewer currently supports **SEM bead** and **SEM coverage** modes:
 
 ```bat
 python run_diagnostic_viewer.py --mode beads --config sem_bead_viewer_config.json
@@ -220,7 +207,7 @@ changed. Click **Save tuned config** or press `S` to write a separate tuned copy
 Sliders now update their numeric values while dragging but commit on mouse
 release. The **Apply changes** button commits the current pending values
 explicitly, which is useful after keyboard edits or coordinated multi-control
-changes. The title and status area distinguish `PENDING`, `RUNNING`, and
+changes. The title and status area distinguishes `PENDING`, `RUNNING`, and
 `UP TO DATE`.
 
 - Left/Right or the Previous/Next buttons navigate images; Home/End select the first/last image.
@@ -267,9 +254,61 @@ Ag coverage detector, and Global sphere filters.
 TEM diagnostics are still planned but are not implemented in this unified
 diagnostic application yet.
 
-## 5. Input files and physical calibration
+## 6. Regular interactive viewers
 
-### 5.1 SEM TIFF and HDR
+Run commands from the project folder while `.venv` is active.
+
+### 6.1 SEM bead size
+
+```bat
+python run_bead_viewer.py
+python run_bead_viewer.py --help
+python run_bead_viewer.py --config sem_bead_viewer_config.json
+```
+
+The viewer loads lowercase **`.tif`** files directly inside `folder`.
+Left/right arrows change images.
+Checkboxes control the scale bar, boundaries, and size labels.
+Use `--folder PATH` for a temporary folder override without changing the JSON config.
+
+### 6.2 SEM Ag coverage
+
+```bat
+python run_sem_coverage_viewer.py
+python run_sem_coverage_viewer.py --help
+python run_sem_coverage_viewer.py --config sem_coverage_viewer_config.json --folder "C:/Data/SEM coverage"
+```
+
+Left/right arrows change images. Up/down arrows switch diagnostic layers:
+
+- `display` - original image scaled for display,
+- `norm` - normalization used for bead detection,
+- `bead_raw` - initial ROI candidates,
+- `bead_refined` - final bead ROIs,
+- `ag_count_feature` - top-hat response used for Ag peaks,
+- `ag_coverage_feature` - response used for the coverage mask.
+
+The launcher also supports `--file PATH` for a temporary single-image selection.
+
+### 6.3 TEM particle size
+
+```bat
+python run_tem_particle_viewer.py
+python run_tem_particle_viewer.py --help
+python run_tem_particle_viewer.py --config tem_particle_viewer_config.json --file "TEM SeNPs 1.png"
+```
+
+Left/right arrows change images. The window shows the original image, detector feature map,
+overlay, and histogram/statistics.
+
+Regular viewers can optionally write summary JSON files when `summary_json_path`
+is configured. For routine final multi-sample processing, the batch exporters are
+recommended instead. CSV and XLSX output belongs to the batch/export layer, not
+the regular viewer layer.
+
+## 7. Input files and physical calibration
+
+### 7.1 SEM TIFF and HDR
 
 For `sample.tif`, the SEM viewers look for metadata in:
 
@@ -280,32 +319,33 @@ sample-tif.hdr
 The HDR file supplies pixel size, magnification, and measurement information.
 Analysis can run without HDR, but sizes and scale bars may remain in pixels.
 
-### 5.2 TEM
+### 7.2 TEM
 
 The TEM loader currently supports only grayscale, RGB, and RGBA PNG/JPG images.
 Enter either `pixel_size_nm` or `fov_nm` for physical sizes.
 A direct `pixel_size_nm` value take precedence.
 
-## 6. Batch exports
+## 8. Batch exports and table formats
 
-### 6.1 SEM bead and coverage export
+### 8.1 SEM bead and coverage export
 
 Beads only:
 
 ```bat
-python batch_export_protolols.py --bead-root "C:/Data/SEM/size" --output-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --outputs-dir "C:/Data/results_sem" --clean
 ```
 
 Coverage only:
 
 ```bat
-python batch_export_protolols.py --coverage-root "C:/Data/SEM/coverage" --output-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --coverage-root "C:/Data/SEM/coverage" --outputs-dir "C:/Data/results_sem" --clean
 ```
 
 Both tasks:
 
 ```bat
-python batch_export_protolols.py --bead-root "C:/Data/SEM/size" --coverage-root "C:/Data/SEM/coverage" --output-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --coverage-root "C:/Data/SEM/coverage" --outputs-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --outputs-dir outputs --table-format both
 ```
 
 Optional arguments:
@@ -313,44 +353,47 @@ Optional arguments:
 - `--bead-config FILE` - alternate bead-analysis template,
 - `--coverage-config FILE` - alternate coverage template,
 - `--clean` - remove previous JSON/CSV/PNG outputs in the target structure before running,
-- `--no-export` - crete per-sample JSON and overlay PNG files but skip final CSV/histogram generation.
+- `--table-format {csv,xlsx,both,none}` - choose summary table output,
+- `--sort-by {name,path,none}` - control deterministic natural sorting,
+- `--no-export` - create per-sample JSON and overlay PNG files but skip final table/histogram generation,
+- `--no-csv`, `--no-bead-csv`, and `--no-coverage-csv` - suppress only CSV files,
+- `--no-histograms` - keep summary tables but skip bead histograms.
 
-Typical outputs include per-sample JSON, `size_png`, `coverage_png`, `bead_global_summaries.csv`, 
-`coverage_global_summaries.csv`, and `bead_histograms`.
+Typical outputs include per-sample JSON, `size_png`, `coverage_png`,
+`bead_global_summaries.csv`, `coverage_global_summaries.csv`,
+`sem_global_summaries.xlsx`, and `bead_histograms`.
 
-### 6.2 TEM batch export
+### 8.2 TEM batch export
 
 ```bat
-python batch_export_tem_protocols.py --root "C:/Data/TEM" --output-dir "C:/Data/results_tem" --clean
+python batch_export_tem_protocols.py --root "C:/Data/TEM" --outputs-dir "C:/Data/results_tem" --clean
+python batch_export_tem_protocols.py --root "C:/Data/TEM" --outputs-dir outputs_tem --table-format xlsx
 ```
 
 Optional arguments:
 
 - `--config FILE` - alternate TEM template,
 - `--clean` - delete old TEM outputs,
-- `--no-csv` - skip CSV creation,
+- `--table-format {csv,xlsx,both,none}` - choose summary table output,
+- `--sort-by {name,path,none}` - control deterministic natural sorting,
+- `--no-csv` - skip CSV creation while leaving XLSX enabled,
 - `--no-histograms` - skip histogram creation.
 
-Outputs include per-sample and global JSON, per-image JSON, overlay PNG files, two CSV summaries, and histograms.
+Outputs include per-sample and global JSON, per-image JSON, overlay PNG files,
+two CSV summaries, `tem_summaries.xlsx`, and histograms.
 
-### 6.3 Regenerating SEM summaries from existing JSON files
+### 8.3 Regenerating SEM summaries from existing JSON files
 
 ```bat
 python export_output_summaries.py --outputs-dir "C:/Data/results_sem"
+python export_output_summaries.py --outputs-dir "C:/Data/results_sem" --table-format both
 ```
 
-Use this when SEM JSON files already exist, and you want to regenerate the CSV/histogram outputs.
+Use this when SEM JSON files already exist and you want to regenerate CSV,
+XLSX, or histogram outputs later. The legacy `--no-csv`, `--no-bead-csv`,
+`--no-coverage-csv`, and `--no-histograms` switches remain available here.
 
-## 7. Recommended tuning workflow
-
-1. Verify footer cropping and physical calibration first.
-2. Tune using at least several representative images, not one ideal image.
-3. Tune coarse segmentation first, touching-object splitting second, and outlier filters last.
-4. Change one parameter group at a time in the diagnostic viewer and compare its live stages and overlays.
-5. Keep a separate configuration for each image type and/or acquisition protocol.
-6. Before batch export, manually review several images from every sample group.
-
-# 8. Configuration reference: `sem_bead_viewer_config.json`
+# 9. Configuration reference: `sem_bead_viewer_config.json`
 
 This tool detects **bright beads on a darker background**, measures x/y dimensions, and classifies candidates as valid (green) or rejected (red).
 
@@ -396,11 +439,11 @@ This tool detects **bright beads on a darker background**, measures x/y dimensio
 | `default_show_boundaries` = `true`     | Initial visibility of valid/rejected boundaries.                                                    | Display only.                                                                                                                              |
 | `default_show_measures` = `true`       | Initial visibility of size crosses and labels.                                                      | Disable for dense images where labels obscure the image.                                                                                   |
 
-# 9. Configuration reference: `sem_coverage_viewer_config.json`
+# 10. Configuration reference: `sem_coverage_viewer_config.json`
 
 The viewer first identifies bead ROIs and then estimates projected Ag coverage and Ag peak count.
 
-## 9.1 `viewer.analyzer`
+## 10.1 `viewer.analyzer`
 
 | Parameter                             | What it controls                                                                             | Tuning advice / common problems                                                                                               |
 |---------------------------------------|----------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
@@ -420,7 +463,7 @@ The viewer first identifies bead ROIs and then estimates projected Ag coverage a
 | `count_thr_rel` = `1.0`               | Multiplier applied to the automatic threshold for accepting a peak.                          | Higher gives fewer, stronger peaks. Lower gives more particles and more possible false peaks.                                 |
 | `display_percentiles` = `[0.5, 99.5]` | Contrast scaling used only for display.                                                      | Does not change numerical Ag segmentation; change only for viewer readability.                                                |
 
-## 9.2 Other `viewer` parameters
+## 10.2 Other `viewer` parameters
 | Parameter                                     | What it controls                                                                                               | Tuning advice / common problems                                                                                                                         |
 |-----------------------------------------------|----------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `detector_choice_index` = `0`                 | Tile index for a multi-detector TIFF according to `ViewFiieldsCountX/Y` in the HDR file; indexing starts at 0. | Keep 0 for a normal single image. An invalid index raises an error.                                                                                     |
@@ -466,7 +509,7 @@ The viewer first identifies bead ROIs and then estimates projected Ag coverage a
 | `default_show_ag_count_boundary` = `false`    | Initial visibility of the yellow count-mask boundary.                                                          | Enable while comparing count and coverage segmentation.                                                                                                 |
 | `default_show_ag_peaks` = `false`             | Initial visibility of cyan peaks used for Ag counting.                                                         | Useful when tuning `count_min_distance` and `count_thr_rel`                                                                                             |
 
-# Configuration reference: `tem_particle_viewer_config.json`
+# 11. Configuration reference: `tem_particle_viewer_config.json`
 
 This viewer detects **dark TEM particles on a brighter background**, optionally separates touching regions,
 measures boundary-constrained axes, and reports a size distribution.
@@ -509,9 +552,9 @@ measures boundary-constrained axes, and reports a size distribution.
 | `default_show_measures` = `false`     | Initial visibility of axes and labels.                                                             | For dense clusters, `false` is recommended; enable with the checkbox for inspection.                                                        |
 | `default_show_histogram` = `true`     | Initial histogram visbility in the fourth panel.                                                   | If `false`, only text statistics are shown.                                                                                                 |
 
-# 11. Troubleshooting
+# 12. Troubleshooting
 
-## 11.1 General problems
+## 12.1 General problems
 
 | Problem                                          | Likely cause                                                               | Solution                                                                                                        |
 |--------------------------------------------------|----------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
@@ -527,7 +570,7 @@ measures boundary-constrained axes, and reports a size distribution.
 | First image is slow                              | Initial analysis and morphology can be expensive                           | Wait for completion; viewer results are cached during navigation. Batch scripts show progress.                  |
 | Labels obscure the image                         | The image is dense                                                         | Disable the Measures checkbox or set the relevant `default_show_measures=false`.                                |
 
-## 11.2 SEM bead viewer
+## 12.2 SEM bead viewer
 
 | Symptom                                            | Parameters to try                                                                                                                                         |
 |----------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -540,7 +583,7 @@ measures boundary-constrained axes, and reports a size distribution.
 | One mode of a bimodal mixture is marked as outlier | Set `global_size_outliers=false`.                                                                                                                         |
 | Cropped beads enter statistics                     | Set `include_edge_candidates=false`; optionally increase `edge_touch_margin_px`                                                                           |
 
-## 11.3 SEM coverage viewer
+## 12.3 SEM coverage viewer
 
 | Symptom                                    | Parameters to try                                                                                                                                                                  |
 |--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -555,7 +598,7 @@ measures boundary-constrained axes, and reports a size distribution.
 | Bright bead rim is classified as Ag        | Increase `ag_erode_bead_radius`, while checking that true edge particles are not lost.                                                                                             |
 | Changing `ag_coverage_*` has no effect     | `ag_enable_secondary_coverage` is `false`; enable it or remember coverage is then derived from the count mask.                                                                     |
 
-## 11.4 TEM viewer
+## 12.4 TEM viewer
 
 | Symptom                                   | Parameters to try                                                                                                                                                          |
 |-------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -570,7 +613,7 @@ measures boundary-constrained axes, and reports a size distribution.
 | Image is cropped too high                 | Increase `dark_footer_k_mad` or `dark_footer_min_run`; fixed correct `strip_rows` is most reliable.                                                                        |
 | Sizes in nm are wrong                     | Verify `pixel_size_nm`/`fov_nm`; direct pixel size has priority. Confirm the FOV refers to the full image width.                                                           |
 
-# 12. Current-version behavior and limitations
+# 13. Current behavior and limitations
 
 - Interactive SEM viewers search only for lowercase `.tif`.
 - Interactive SEM viewers do not recurse into subfolders. SEM batch processing does recurse and treats each folder containing TIFF files as one sample.

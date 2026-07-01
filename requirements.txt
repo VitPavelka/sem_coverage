@@ -4,3 +4,4 @@ matplotlib
 scikit-image>=0.26
 tiffile
 tqdm
+openpyxl
