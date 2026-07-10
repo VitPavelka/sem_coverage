@@ -125,12 +125,26 @@ def export_csv_summaries(
     )
 
 
-def _bead_diameters_um(data: dict) -> np.ndarray:
+def bead_histogram_values(data: dict) -> tuple[np.ndarray, str]:
+    """Return the exact valid mean-X/Y diameter vector used by a histogram."""
+
     vals_m = []
+    vals_px = []
     for image in data.get("images", []):
         vals_m.extend(v for v in image.get("diameters_m", []) if v is not None)
-    vals_um = [float(v) * 1e6 for v in vals_m if math.isfinite(float(v))]
-    return np.array(vals_um, dtype=np.float64)
+        vals_px.extend(v for v in image.get("mean_xy_diameters_px", []) if v is not None)
+    if vals_m:
+        values = [float(v) * 1e6 for v in vals_m if math.isfinite(float(v))]
+        return np.array(values, dtype=np.float64), "mean_xy_diameter_um"
+    values = [float(v) for v in vals_px if math.isfinite(float(v))]
+    return np.array(values, dtype=np.float64), "mean_xy_diameter_px"
+
+
+def _bead_diameters_um(data: dict) -> np.ndarray:
+    """Backward-compatible calibrated histogram-vector helper."""
+
+    values, header = bead_histogram_values(data)
+    return values if header.endswith("_um") else np.array([], dtype=np.float64)
 
 
 def _safe_name(name: str) -> str:
@@ -138,42 +152,43 @@ def _safe_name(name: str) -> str:
     return "_".join(safe.split())
 
 
-def _format_stats_text(vals_um: np.ndarray) -> str:
-    if vals_um.size == 0:
+def _format_stats_text(values: np.ndarray, unit: str) -> str:
+    if values.size == 0:
         return "No valid diameters"
-    mean = float(np.mean(vals_um))
-    median = float(np.median(vals_um))
-    sd = float(np.std(vals_um, ddof=1)) if vals_um.size > 1 else 0.0
+    mean = float(np.mean(values))
+    median = float(np.median(values))
+    sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
     cv = (sd / mean * 100.0) if mean > 0 else float("nan")
     return "\n".join(
         [
-            f"n = {vals_um.size}",
-            f"mean = {mean:.3f} um",
-            f"median = {median:.3f} um",
-            f"SD = {sd:.3f} um",
+            f"n = {values.size}",
+            f"mean = {mean:.3f} {unit}",
+            f"median = {median:.3f} {unit}",
+            f"SD = {sd:.3f} {unit}",
             f"CV = {cv:.1f} %",
         ]
     )
 
 
-def _plot_bead_histogram(vals_um: np.ndarray, title: str, output_path: Path) -> None:
+def _plot_bead_histogram(values: np.ndarray, title: str, output_path: Path, header: str = "mean_xy_diameter_um") -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    if vals_um.size:
-        bins = min(max(8, int(np.sqrt(vals_um.size))), 40)
-        ax.hist(vals_um, bins=bins, color="#4cc9f0", edgecolor="#0b1f2a", alpha=0.9)
-        ax.axvline(float(np.mean(vals_um)), color="#d00000", linewidth=1.5)
-        ax.axvline(float(np.median(vals_um)), color="#2d6a4f", linewidth=1.5, linestyle="--")
+    if values.size:
+        bins = min(max(8, int(np.sqrt(values.size))), 40)
+        ax.hist(values, bins=bins, color="#4cc9f0", edgecolor="#0b1f2a", alpha=0.9)
+        ax.axvline(float(np.mean(values)), color="#d00000", linewidth=1.5)
+        ax.axvline(float(np.median(values)), color="#2d6a4f", linewidth=1.5, linestyle="--")
     else:
         ax.text(0.5, 0.5, "No valid diameters", ha="center", va="center", transform=ax.transAxes)
 
     ax.set_title(title)
-    ax.set_xlabel("Diameter [um]")
+    unit = "um" if header.endswith("_um") else "px"
+    ax.set_xlabel(f"Mean X/Y diameter [{unit}]")
     ax.set_ylabel("Count")
     ax.grid(True, alpha=0.25)
     ax.text(
         0.98,
         0.98,
-        _format_stats_text(vals_um),
+        _format_stats_text(values, unit),
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -185,27 +200,44 @@ def _plot_bead_histogram(vals_um: np.ndarray, title: str, output_path: Path) -> 
     plt.close(fig)
 
 
+def _write_histogram_values(values: np.ndarray, header: str, output_path: Path) -> Path:
+    """Write the same immutable vector supplied to the matching histogram."""
+
+    lines = [header]
+    lines.extend(format(float(value), ".17g") for value in values)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
+
+
 def export_bead_histograms(outputs_dir: Path = OUTPUTS_DIR, hist_dir: Path | None = None) -> list[Path]:
     hist_dir = hist_dir or outputs_dir / BEAD_HISTOGRAM_DIR_NAME
     hist_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    combined: list[np.ndarray] = []
+    combined: dict[str, list[np.ndarray]] = {"mean_xy_diameter_um": [], "mean_xy_diameter_px": []}
 
     for json_path in sort_paths(list(outputs_dir.glob("*.json"))):
         data = _load_json(json_path)
         if _classify_summary(data) != "bead":
             continue
-        vals_um = _bead_diameters_um(data)
-        combined.append(vals_um)
-        out_path = hist_dir / f"{_safe_name(json_path.stem)}_diameter_histogram.png"
-        _plot_bead_histogram(vals_um, json_path.stem, out_path)
+        values, header = bead_histogram_values(data)
+        combined[header].append(values)
+        unit_suffix = "um" if header.endswith("_um") else "px"
+        stem = f"{_safe_name(json_path.stem)}_bead_mean_xy_diameter_{unit_suffix}"
+        out_path = hist_dir / f"{stem}_histogram.png"
+        _plot_bead_histogram(values, json_path.stem, out_path, header)
         written.append(out_path)
+        written.append(_write_histogram_values(values, header, hist_dir / f"{stem}_values.txt"))
 
-    if combined:
-        all_vals = np.concatenate([vals for vals in combined if vals.size]) if any(vals.size for vals in combined) else np.array([], dtype=np.float64)
-        out_path = hist_dir / "all_bead_diameter_histogram.png"
-        _plot_bead_histogram(all_vals, "All bead outputs", out_path)
+    for header, vectors in combined.items():
+        if not vectors:
+            continue
+        all_vals = np.concatenate([vals for vals in vectors if vals.size]) if any(vals.size for vals in vectors) else np.array([], dtype=np.float64)
+        unit_suffix = "um" if header.endswith("_um") else "px"
+        stem = f"all_bead_mean_xy_diameter_{unit_suffix}"
+        out_path = hist_dir / f"{stem}_histogram.png"
+        _plot_bead_histogram(all_vals, "All bead outputs", out_path, header)
         written.append(out_path)
+        written.append(_write_histogram_values(all_vals, header, hist_dir / f"{stem}_values.txt"))
     return written
 
 

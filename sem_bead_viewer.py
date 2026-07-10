@@ -828,7 +828,12 @@ def build_bead_summary(folder: str | Path, config: ViewerConfig) -> dict:
     for image_path in image_paths:
         res = analyze_bead_image(image_path, config)
         valid = [m for m in res.measurements if m.valid]
-        valid_diams = [m.mean_diameter_m for m in valid if m.mean_diameter_m is not None]
+        # The histogram source is the valid-bead mean X/Y diameter, not
+        # equivalent diameter.  Keep both calibrated and pixel vectors so an
+        # uncalibrated image can still be exported without changing filtering.
+        valid_pairs = [(m.mean_diameter_m, (m.x_diameter_px + m.y_diameter_px) / 2.0) for m in valid]
+        valid_diams = [diameter_m for diameter_m, _diameter_px in valid_pairs if diameter_m is not None]
+        valid_diams_px = [float(diameter_px) for _diameter_m, diameter_px in valid_pairs]
         image_entry = {
             "file": image_path.name,
             "sample": image_path.parent.name,
@@ -842,6 +847,8 @@ def build_bead_summary(folder: str | Path, config: ViewerConfig) -> dict:
             "device": res.metadata.device,
             "magnification": _safe_float(res.metadata.magnification),
             "diameters_m": [_safe_float(v) for v in valid_diams],
+            "mean_xy_diameters_px": [_safe_float(v) for v in valid_diams_px],
+            "histogram_metric": "mean_xy_diameter",
             "mean_diameter_m": _safe_float(float(np.mean(valid_diams))) if valid_diams else None,
             "median_diameter_m": _safe_float(float(np.median(valid_diams))) if valid_diams else None,
             "sd_diameter_m": _safe_float(float(np.std(valid_diams, ddof=1))) if len(valid_diams) > 1 else 0.0 if valid_diams else None,

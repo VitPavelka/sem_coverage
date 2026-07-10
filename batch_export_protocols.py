@@ -309,6 +309,8 @@ def _remove_outputs(outputs_dir: Path) -> None:
     if hist_dir.exists():
         for path in hist_dir.glob("*.png"):
             path.unlink()
+        for path in hist_dir.glob("*.txt"):
+            path.unlink()
     for png_dir_name in ("size_png", "coverage_png"):
         png_dir = outputs_dir / png_dir_name
         if png_dir.exists():

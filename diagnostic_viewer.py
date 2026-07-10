@@ -54,6 +54,8 @@ from sem_coverage_viewer import (
     BeadMetrics,
     CoverageAppConfig,
     CoverageImageResult,
+    CoverageSegmentationFailure,
+    CoverageSegmentationDiagnostics,
     CoverageViewerConfig,
     FailedImagePreview,
     _format_length_m as _format_coverage_length_m,
@@ -67,6 +69,7 @@ from sem_coverage_viewer import (
     load_app_config as load_coverage_app_config,
     load_failed_image_preview,
 )
+from coverage_cap import compute_coverage_cap_metrics
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer
 
 LOGGER = logging.getLogger(__name__)
@@ -1105,6 +1108,8 @@ class CoverageDiagnosticAdapter:
         "ag_coverage_mask",
         "ag_peak_map",
         "roi_index_map",
+        "raw_bead_candidates",
+        "rejected_bead_candidates",
     )
 
     INCLUDED_COLOR = (0.0, 1.0, 0.0, 1.0)
@@ -1112,6 +1117,7 @@ class CoverageDiagnosticAdapter:
     AG_COVERAGE_COLOR = (1.0, 0.0, 1.0, 1.0)
     AG_COUNT_COLOR = (1.0, 1.0, 0.0, 1.0)
     AG_PEAK_COLOR = "cyan"
+    CAP_COLOR = (0.3, 0.8, 1.0, 1.0)
     DIAMETER_X_COLOR = "cyan"
     DIAMETER_Y_COLOR = "orange"
 
@@ -1715,6 +1721,32 @@ class CoverageDiagnosticAdapter:
                 active_when=_global_solidity_active,
             ),
         ),
+        "Coverage cap": (
+            _spec(
+                "coverage_cap_enabled", "Enable central coverage cap", "Coverage cap", "bool",
+                None, None, None,
+                "Uses a central circular cap for the selected coverage metric. Disable to retain legacy full projected coverage.",
+                requires_analysis=False,
+            ),
+            _spec(
+                "coverage_cap_radius_fraction", "Cap projected radius fraction", "Coverage cap", "float",
+                0.01, 1.0, 0.01,
+                "Projected cap radius a/R. Increase to inspect farther toward the sphere edge; decrease to focus on the central surface.",
+                requires_analysis=False,
+            ),
+            _spec(
+                "coverage_cap_min_completeness", "Minimum cap completeness", "Coverage cap", "float",
+                0.0, 1.0, 0.01,
+                "Minimum retained fraction of the theoretical cap circle. Increase to reject caps clipped by an incomplete bead mask.",
+                requires_analysis=False,
+            ),
+            _spec(
+                "coverage_cap_surface_weighting_enabled", "Experimental surface weighting", "Coverage cap", "bool",
+                None, None, None,
+                "EXPERIMENTAL: also reports curvature-weighted cap coverage. It never replaces the selected projected coverage.",
+                requires_analysis=False,
+            ),
+        ),
     }
 
     def load_config(
@@ -1759,7 +1791,14 @@ class CoverageDiagnosticAdapter:
     def analyze(
         self, image_path: Path, config: CoverageViewerConfig
     ) -> CoverageImageResult:
-        return analyze_coverage_image(image_path, config=config)
+        try:
+            return analyze_coverage_image(image_path, config=config, collect_diagnostics=True)
+        except CoverageSegmentationFailure as exc:
+            # The generic controller caches this exact exception/config pair;
+            # retaining it here lets failure stages render without rerunning.
+            self._failure_by_key = getattr(self, "_failure_by_key", {})
+            self._failure_by_key[(str(image_path.resolve()), repr(config))] = exc
+            raise
 
     def parameter_groups(self) -> Mapping[str, tuple[ParameterSpec, ...]]:
         return self._GROUPS
@@ -1879,6 +1918,10 @@ class CoverageDiagnosticAdapter:
             return "Maximum global anisotropy ratio must be at least 1."
         if not 0.0 <= config.min_global_sphere_solidity <= 1.0:
             return "Minimum global solidity must be between 0 and 1."
+        if not 0.0 < config.coverage_cap_radius_fraction <= 1.0:
+            return "Coverage cap radius fraction must satisfy 0 < f <= 1."
+        if not 0.0 <= config.coverage_cap_min_completeness <= 1.0:
+            return "Coverage cap minimum completeness must be between 0 and 1."
         if image_path is not None:
             hdr_path = _paired_hdr_path(Path(image_path))
             if hdr_path is not None:
@@ -1945,6 +1988,18 @@ class CoverageDiagnosticAdapter:
             return "included"
         return "excluded: " + ", ".join(reasons)
 
+    @staticmethod
+    def _cap_for_roi(roi: BeadCoverageResult, config: CoverageViewerConfig, pixel_size_m: float | None):
+        """Recompute only cap post-processing from the already accepted masks."""
+
+        return compute_coverage_cap_metrics(
+            roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc,
+            roi.bead_metrics.sphere_radius_px, config.coverage_cap_radius_fraction,
+            pixel_size_m,
+            compute_surface_weighted=config.coverage_cap_surface_weighting_enabled,
+            min_completeness=config.coverage_cap_min_completeness,
+        )
+
     def render_stage(
         self,
         result: CoverageImageResult,
@@ -1995,6 +2050,14 @@ class CoverageDiagnosticAdapter:
             return base
         if stage == "roi_index_map":
             return self._roi_index_map(result, roi_selection)
+        if stage == "raw_bead_candidates":
+            diagnostics = result.diagnostics
+            mask = diagnostics.raw_candidate_union if diagnostics is not None else result.bead_raw_union
+            return _coverage_rgb(mask.astype(np.float32))
+        if stage == "rejected_bead_candidates":
+            diagnostics = result.diagnostics
+            mask = diagnostics.rejected_candidate_union if diagnostics is not None else np.zeros(result.display.shape, dtype=bool)
+            return _coverage_rgb(mask.astype(np.float32))
         raise ValueError(f"Unknown coverage diagnostic stage: '{stage}'.")
 
     def make_overlay_data(
@@ -2018,6 +2081,31 @@ class CoverageDiagnosticAdapter:
                     control_label="Bead boundaries",
                     mask=find_boundaries(roi.bead_mask, mode="outer"),
                     color=self.INCLUDED_COLOR if included else self.EXCLUDED_COLOR,
+                )
+            )
+            cap = self._cap_for_roi(roi, config, result.metadata.mean_pixel_size_m)
+            boundary_layers.append(
+                BoundaryLayer(
+                    control_label="Cap boundary",
+                    mask=find_boundaries(cap.geometry.theoretical_circle_mask, mode="outer"),
+                    color=self.CAP_COLOR,
+                )
+            )
+            point_layers.append(
+                PointOverlay(
+                    control_label="Cap center",
+                    rows=np.array([cap.geometry.center_rc[0]]),
+                    cols=np.array([cap.geometry.center_rc[1]]),
+                    color="white", marker="+", markersize=7.0,
+                )
+            )
+            text_overlays.append(
+                TextOverlay(
+                    control_label="Cap completeness status",
+                    row=cap.geometry.center_rc[0] + 12.0,
+                    col=cap.geometry.center_rc[1],
+                    text=(f"cap {cap.geometry.completeness:.3f}" if cap.valid else f"cap invalid: {cap.invalid_reason}"),
+                    color="white" if cap.valid else "red", fontsize=7.0, boxed=True,
                 )
             )
             boundary_layers.append(
@@ -2176,9 +2264,19 @@ class CoverageDiagnosticAdapter:
                 if roi.sphere_np_density_per_um2 is not None
                 else "n/a"
             )
+            cap = self._cap_for_roi(roi, config, result.metadata.mean_pixel_size_m)
+            cap_text = (
+                f"cap {cap.projected_coverage * 100.0:.2f}%"
+                if cap.projected_coverage is not None else f"cap invalid ({cap.geometry.completeness:.3f})"
+            )
+            weighted_text = (
+                f" | experimental weighted {cap.surface_weighted_coverage * 100.0:.2f}%"
+                if cap.surface_weighted_coverage is not None else ""
+            )
             return (
                 f"ROI {roi.roi_index} | {self._coverage_status(roi, config)} | "
-                f"coverage {roi.coverage_percent:.2f}% | projected {roi.projected_ag_count} | "
+                f"selected {cap_text if config.coverage_cap_enabled else f'legacy {roi.legacy_full_projected_coverage_percent:.2f}%'} | "
+                f"legacy {roi.legacy_full_projected_coverage_percent:.2f}% | {cap_text}{weighted_text} | projected {roi.projected_ag_count} | "
                 f"sphere {roi.sphere_ag_count_est:.1f} | density {density} | "
                 f"eq {eq_text} | anisotropy {metrics.anisotropy_ratio:.3f} | "
                 f"solidity {metrics.solidity:.3f} | count thr {roi.ag_count_threshold:.4f} | "
@@ -2188,7 +2286,13 @@ class CoverageDiagnosticAdapter:
         included = [
             roi for roi in result.roi_results if _include_roi_in_global_summary(roi, config)
         ]
-        coverage_values = [roi.coverage_percent for roi in included]
+        coverage_values = []
+        for roi in included:
+            cap = self._cap_for_roi(roi, config, result.metadata.mean_pixel_size_m)
+            if config.coverage_cap_enabled and cap.projected_coverage is not None:
+                coverage_values.append(cap.projected_coverage * 100.0)
+            else:
+                coverage_values.append(roi.legacy_full_projected_coverage_percent)
         densities = [
             roi.sphere_np_density_per_um2
             for roi in included
@@ -2216,6 +2320,12 @@ class CoverageDiagnosticAdapter:
             "Ag count boundaries",
             "Ag peak markers",
             "ROI index labels",
+            "Cap boundary",
+            "Cap center",
+            "Cap completeness status",
+            "Rejected candidate boundaries",
+            "Raw candidate boundaries",
+            "Rejected candidate labels",
             self.scale_bar_label,
         )
 
@@ -2229,6 +2339,12 @@ class CoverageDiagnosticAdapter:
             "Ag count boundaries": bool(config.default_show_ag_count_boundary),
             "Ag peak markers": bool(config.default_show_ag_peaks),
             "ROI index labels": True,
+            "Cap boundary": True,
+            "Cap center": True,
+            "Cap completeness status": True,
+            "Rejected candidate boundaries": True,
+            "Raw candidate boundaries": False,
+            "Rejected candidate labels": True,
             self.scale_bar_label: bool(config.default_show_scale),
         }
 
@@ -2247,6 +2363,9 @@ class CoverageDiagnosticAdapter:
     def load_failed_preview(
         self, image_path: Path, config: CoverageViewerConfig
     ) -> FailedImagePreview | None:
+        failure = getattr(self, "_failure_by_key", {}).get((str(image_path.resolve()), repr(config)))
+        if failure is not None:
+            return failure.preview
         return load_failed_image_preview(image_path, config)
 
     def render_failed_preview(
@@ -2256,10 +2375,16 @@ class CoverageDiagnosticAdapter:
         current_config: CoverageViewerConfig | None = None,
     ) -> np.ndarray:
         config = self._effective_config(preview, current_config)
+        failure = getattr(self, "_failure_by_key", {}).get((str(preview.image_path.resolve()), repr(config)))
+        diagnostics = failure.diagnostics if failure is not None else None
         if stage == "norm":
             return _coverage_rgb(np.clip(preview.norm.astype(np.float32), 0.0, 1.0))
         if stage in {"overlay", "display", "ag_peak_map"}:
             return _coverage_rgb(self._display_image(preview.cropped, config))
+        if stage == "raw_bead_candidates" and diagnostics is not None:
+            return _coverage_rgb(diagnostics.raw_candidate_union.astype(np.float32))
+        if stage == "rejected_bead_candidates" and diagnostics is not None:
+            return _coverage_rgb(diagnostics.rejected_candidate_union.astype(np.float32))
         return _coverage_rgb(np.zeros(preview.display.shape, dtype=np.float32))
 
     def summarize_failed_preview(
@@ -2273,9 +2398,30 @@ class CoverageDiagnosticAdapter:
         if preview is not None and preview.metadata.mean_pixel_size_m is not None:
             pixel_text = f" | pixel {_format_coverage_length_m(preview.metadata.mean_pixel_size_m)}/px"
         return (
-            f"Coverage analysis failed after {duration_s:.3f} s | {error} | "
+            f"Coverage analysis found no accepted ROI after {duration_s:.3f} s | {error} | "
             f"Adjust ROI or detector parameters to recover valid bead ROIs{pixel_text}"
         )
+
+    def make_failed_overlay_data(
+        self, preview: FailedImagePreview, config: CoverageViewerConfig
+    ) -> OverlayData:
+        """Render structured rejected candidates without rerunning segmentation."""
+
+        failure = getattr(self, "_failure_by_key", {}).get((str(preview.image_path.resolve()), repr(config)))
+        diagnostics = failure.diagnostics if failure is not None else None
+        if diagnostics is None:
+            return OverlayData((), (), (), (), preview.metadata.mean_pixel_size_m, preview.display.shape)
+        layers = (
+            BoundaryLayer("Rejected candidate boundaries", find_boundaries(diagnostics.rejected_candidate_union, mode="outer"), self.EXCLUDED_COLOR),
+            BoundaryLayer("Raw candidate boundaries", find_boundaries(diagnostics.raw_candidate_union, mode="outer"), (1.0, 0.8, 0.0, 1.0)),
+        )
+        labels = tuple(
+            TextOverlay("Rejected candidate labels", candidate.centroid_rc[0], candidate.centroid_rc[1],
+                        f"{candidate.candidate_index}: " + "; ".join(candidate.rejection_reasons),
+                        "red", fontsize=7.0, boxed=True)
+            for candidate in diagnostics.rejected_candidates
+        )
+        return OverlayData(layers, (), (), labels, preview.metadata.mean_pixel_size_m, preview.display.shape)
 
     def roi_options(self, result: CoverageImageResult | None) -> tuple[int, ...]:
         if result is None:
@@ -2301,6 +2447,8 @@ class CoverageDiagnosticAdapter:
             "ag_count_mask": "Ag count mask",
             "ag_coverage_mask": "Ag coverage mask",
             "roi_index_map": "ROI index map",
+            "raw_bead_candidates": "Raw bead candidates",
+            "rejected_bead_candidates": "Rejected bead candidates",
         }
         if stage in labels and not np.any(pixels):
             return f"{labels[stage]}: empty"
@@ -2369,6 +2517,7 @@ class AnalysisController:
         self._asynchronous = asynchronous
         self._cache_size = max(1, int(cache_size))
         self._cache: OrderedDict[tuple[str, Any], tuple[Any, float]] = OrderedDict()
+        self._failure_cache: OrderedDict[tuple[str, Any], tuple[BaseException, float]] = OrderedDict()
         self._completed: Queue[AnalysisCompletion] = Queue()
         self._executor = ThreadPoolExecutor(max_workers=1) if asynchronous else None
         self._lock = RLock()
@@ -2417,6 +2566,14 @@ class AnalysisController:
                     )
                 )
                 return
+            cached_failure = self._failure_cache.get(key)
+            if cached_failure is not None:
+                self._failure_cache.move_to_end(key)
+                error, duration = cached_failure
+                self._completed.put(
+                    AnalysisCompletion(generation, image_path, config, None, duration, error=error, cached=True, wait_s=0.0)
+                )
+                return
             if not self._asynchronous:
                 pass
             elif self._running is not None:
@@ -2438,12 +2595,14 @@ class AnalysisController:
                 generation, image_path, config, result, duration, wait_s=0.0
             )
         except BaseException as exc:
+            duration = perf_counter() - started
+            self._store_failure(image_path, config, exc, duration)
             completion = AnalysisCompletion(
                 generation,
                 image_path,
                 config,
                 None,
-                perf_counter() - started,
+                duration,
                 error=exc,
                 wait_s=0.0,
             )
@@ -2502,6 +2661,10 @@ class AnalysisController:
                 completion.result,
                 completion.duration_s,
             )
+        elif completion.error is not None and completion.config is not None:
+            self._store_failure(
+                completion.image_path, completion.config, completion.error, completion.duration_s
+            )
         self._completed.put(completion)
         with self._lock:
             self._running = None
@@ -2521,6 +2684,16 @@ class AnalysisController:
             while len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
 
+    def _store_failure(
+        self, image_path: Path, config: Any, error: BaseException, duration_s: float
+    ) -> None:
+        key = self._cache_key(image_path, config)
+        with self._lock:
+            self._failure_cache[key] = (error, duration_s)
+            self._failure_cache.move_to_end(key)
+            while len(self._failure_cache) > self._cache_size:
+                self._failure_cache.popitem(last=False)
+
     def poll(self) -> list[AnalysisCompletion]:
         """Return all currently completed requests without blocking."""
 
@@ -2534,6 +2707,7 @@ class AnalysisController:
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+            self._failure_cache.clear()
 
     @property
     def running(self) -> bool:
@@ -3195,7 +3369,11 @@ class DiagnosticViewer:
             self.current_wait_s = completion.wait_s
             self.current_cached = completion.cached
             if completion.error is not None:
-                LOGGER.error("Analysis failed for %s", completion.image_path, exc_info=completion.error)
+                if isinstance(completion.error, CoverageSegmentationFailure):
+                    LOGGER.warning("No accepted coverage ROI for %s: %s", completion.image_path.name, completion.error)
+                    LOGGER.debug("Structured coverage segmentation failure", exc_info=completion.error)
+                else:
+                    LOGGER.error("Analysis failed for %s", completion.image_path, exc_info=completion.error)
                 self.current_error = completion.error
                 try:
                     self.current_preview = self.adapter.load_failed_preview(
@@ -3268,7 +3446,7 @@ class DiagnosticViewer:
 
     def _render_overlays(self) -> None:
         show = (
-            self.current_result is not None
+            (self.current_result is not None or hasattr(self.adapter, "make_failed_overlay_data"))
             and self.adapter.overlay_stage is not None
             and self.adapter.stages[self.stage_index] == self.adapter.overlay_stage
         )
@@ -3281,9 +3459,14 @@ class DiagnosticViewer:
             self.fig.canvas.draw_idle()
             return
 
-        overlay = self.adapter.make_overlay_data(
-            self.current_result, self._roi_selection, self.current_viewer_config
-        )
+        if self.current_result is not None:
+            overlay = self.adapter.make_overlay_data(
+                self.current_result, self._roi_selection, self.current_viewer_config
+            )
+        elif self.current_preview is not None and hasattr(self.adapter, "make_failed_overlay_data"):
+            overlay = self.adapter.make_failed_overlay_data(self.current_preview, self.current_viewer_config)
+        else:
+            return
         rgba = np.zeros((*overlay.image_shape, 4), dtype=np.float32)
         for layer in overlay.boundary_layers:
             if self.overlay_state.get(layer.control_label, False):

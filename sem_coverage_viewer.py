@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +30,7 @@ from path_utils import (
 )
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
 from tabular_export import sort_paths
+from coverage_cap import CoverageCapMetrics, compute_coverage_cap_metrics
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,12 @@ class CoverageViewerConfig:
     ag_coverage_min_object_size: int = 9
     ag_coverage_closing_radius: int = 1
     ag_coverage_use_union_with_count: bool = True
+    # Central-cap post-processing affects only final coverage reporting; bead
+    # and Ag segmentation masks are always produced by the existing pipeline.
+    coverage_cap_enabled: bool = True
+    coverage_cap_radius_fraction: float = 0.25
+    coverage_cap_min_completeness: float = 0.98
+    coverage_cap_surface_weighting_enabled: bool = False
     default_show_scale: bool = True
     default_show_bead_boundary: bool = True
     default_show_diameter_lines: bool = True
@@ -124,6 +131,11 @@ class BeadMetrics:
     anisotropy_ratio: float
     solidity: float
     sphere_surface_area_m2: Optional[float]
+    sphere_diameter_px: float
+    sphere_diameter_m: Optional[float]
+    sphere_radius_px: float
+    sphere_radius_m: Optional[float]
+    sphere_volume_m3: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -146,6 +158,14 @@ class BeadCoverageResult:
     bead_area_px: int
     ag_area_px: int
     bead_metrics: BeadMetrics
+    legacy_full_projected_coverage: float = 0.0
+    legacy_full_projected_coverage_percent: float = 0.0
+    cap_metrics: CoverageCapMetrics | None = None
+    cap_projected_coverage: float | None = None
+    cap_projected_coverage_percent: float | None = None
+    cap_surface_weighted_coverage: float | None = None
+    cap_surface_weighted_coverage_percent: float | None = None
+    selected_coverage_method: str = "legacy_full_projected"
 
 
 @dataclass(frozen=True)
@@ -163,6 +183,7 @@ class CoverageImageResult:
     ag_coverage_feature_union: np.ndarray
     crop_row: int
     config: CoverageViewerConfig
+    diagnostics: "CoverageSegmentationDiagnostics | None" = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +194,51 @@ class FailedImagePreview:
     display: np.ndarray
     metadata: SEMMetadata
     crop_row: int
+
+
+@dataclass(frozen=True)
+class RejectedBeadCandidate:
+    """One bead candidate rejected by the shared production ROI evaluator."""
+
+    candidate_index: int
+    mask: np.ndarray
+    source: str
+    area_px: int
+    equivalent_diameter_px: float
+    solidity: float
+    anisotropy_ratio: float
+    centroid_rc: tuple[float, float]
+    rejection_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CoverageSegmentationDiagnostics:
+    """Structured candidate data retained for expected tuning failures."""
+
+    stage: str
+    raw_candidate_union: np.ndarray
+    accepted_candidate_union: np.ndarray
+    rejected_candidate_union: np.ndarray
+    rejected_candidates: tuple[RejectedBeadCandidate, ...]
+    primary_error: str | None = None
+    fallback_error: str | None = None
+
+
+class CoverageSegmentationFailure(SegmentationError):
+    """Expected no-ROI outcome with a preview and structured diagnostics."""
+
+    def __init__(self, message: str, preview: FailedImagePreview, diagnostics: CoverageSegmentationDiagnostics):
+        super().__init__(message)
+        self.preview = preview
+        self.diagnostics = diagnostics
+
+
+class _ROIRefinementFailure(SegmentationError):
+    """Internal production-filter failure retaining candidates for diagnostics."""
+
+    def __init__(self, message: str, rejected: list[RejectedBeadCandidate]):
+        super().__init__(message)
+        self.rejected = tuple(rejected)
 
 
 def _dataclass_from_dict(cls, data: dict):
@@ -353,18 +419,63 @@ def _region_stats(mask: np.ndarray) -> Optional[dict[str, float]]:
 
 
 def _is_valid_roi(mask: np.ndarray, config: CoverageViewerConfig) -> bool:
+    return not _roi_rejection_reasons(mask, config)[0]
+
+
+def _roi_rejection_reasons(mask: np.ndarray, config: CoverageViewerConfig) -> tuple[tuple[str, ...], dict[str, float] | None, tuple[float, float]]:
+    """Evaluate the one production ROI rule set and expose its failed clauses."""
+
     stats = _region_stats(mask)
     if stats is None:
-        return False
+        return ("empty component",), None, (float("nan"), float("nan"))
+    region = _largest_region(mask)
+    centroid = (float(region.centroid[0]), float(region.centroid[1])) if region else (float("nan"), float("nan"))
+    reasons: list[str] = []
     if stats["area"] < float(config.min_bead_area_px):
-        return False
+        reasons.append(f"area {stats['area']:.0f} px < min_bead_area_px {config.min_bead_area_px:.0f} px")
     if stats["equivalent_diameter_px"] < float(config.min_roi_eq_diameter_px):
-        return False
+        reasons.append(
+            f"equivalent diameter {stats['equivalent_diameter_px']:.1f} px < "
+            f"min_roi_eq_diameter_px {config.min_roi_eq_diameter_px:.1f} px"
+        )
     if stats["solidity"] < float(config.min_roi_solidity):
-        return False
+        reasons.append(f"solidity {stats['solidity']:.3f} < min_roi_solidity {config.min_roi_solidity:.3f}")
     if stats["anisotropy_ratio"] > float(config.max_roi_anisotropy_ratio):
-        return False
-    return True
+        reasons.append(
+            f"anisotropy {stats['anisotropy_ratio']:.3f} > "
+            f"max_roi_anisotropy_ratio {config.max_roi_anisotropy_ratio:.3f}"
+        )
+    return tuple(reasons), stats, centroid
+
+
+def _evaluate_bead_components(
+    components: list[np.ndarray], config: CoverageViewerConfig, source: str, *, start_index: int = 1
+) -> tuple[list[np.ndarray], list[RejectedBeadCandidate]]:
+    """Apply the shared production ROI filters and retain structured rejections."""
+
+    accepted: list[np.ndarray] = []
+    rejected: list[RejectedBeadCandidate] = []
+    for offset, component in enumerate(components):
+        mask = np.asarray(component, dtype=bool)
+        reasons, stats, centroid = _roi_rejection_reasons(mask, config)
+        if not reasons:
+            accepted.append(mask)
+            continue
+        stats = stats or {"area": 0.0, "equivalent_diameter_px": 0.0, "solidity": 0.0, "anisotropy_ratio": float("inf")}
+        rejected.append(
+            RejectedBeadCandidate(
+                candidate_index=start_index + offset,
+                mask=mask,
+                source=source,
+                area_px=int(stats["area"]),
+                equivalent_diameter_px=float(stats["equivalent_diameter_px"]),
+                solidity=float(stats["solidity"]),
+                anisotropy_ratio=float(stats["anisotropy_ratio"]),
+                centroid_rc=centroid,
+                rejection_reasons=reasons,
+            )
+        )
+    return accepted, rejected
 
 
 def _should_try_split(mask: np.ndarray, config: CoverageViewerConfig) -> bool:
@@ -436,7 +547,9 @@ def _segment_bead_by_morphology(
     analyzer: SEMCoverageAnalyzer,
     cropped: np.ndarray,
     config: CoverageViewerConfig,
-) -> list[np.ndarray]:
+    *,
+    collect_diagnostics: bool = False,
+) -> list[np.ndarray] | tuple[list[np.ndarray], list[RejectedBeadCandidate], np.ndarray]:
     scale = float(config.bead_morph_downscale)
     if not 0.05 <= scale <= 1.0:
         raise SegmentationError("Morphology bead fallback failed: bead_morph_downscale must be between 0.05 and 1.0.")
@@ -469,29 +582,42 @@ def _segment_bead_by_morphology(
     if lab.max() == 0:
         raise SegmentationError("Morphology bead fallback failed: no enclosed component found.")
 
-    candidates = []
+    raw_candidates: list[np.ndarray] = []
     for region in sorted(regionprops(lab), key=lambda item: item.area, reverse=True):
         small_component = lab == region.label
         bead = resize(small_component, cropped.shape, order=0, preserve_range=True, anti_aliasing=False).astype(bool)
         erode_radius = int(config.bead_morph_erode_radius_px)
         if erode_radius > 0:
             bead = erosion(bead, disk(erode_radius))
-        if _is_valid_roi(bead, config):
-            candidates.append(bead)
+        raw_candidates.append(bead)
+    candidates, rejected = _evaluate_bead_components(raw_candidates, config, "morphology fallback")
     if candidates:
-        return [candidates[0]]
+        # Preserve historical selection of the largest valid fallback ROI.
+        selected = [candidates[0]]
+        if collect_diagnostics:
+            raw_union = np.zeros(cropped.shape, dtype=bool)
+            for candidate in raw_candidates:
+                raw_union |= candidate
+            return selected, rejected, raw_union
+        return selected
     raise SegmentationError("Morphology bead fallback failed: no enclosed component passed ROI filters.")
 
 
-def _refine_bead_components(components: list[np.ndarray], config: CoverageViewerConfig) -> list[np.ndarray]:
+def _refine_bead_components(
+    components: list[np.ndarray], config: CoverageViewerConfig, *, collect_diagnostics: bool = False
+) -> list[np.ndarray] | tuple[list[np.ndarray], list[RejectedBeadCandidate]]:
     refined: list[np.ndarray] = []
+    rejected: list[RejectedBeadCandidate] = []
+    candidate_number = 1
     for component in components:
         candidates = _split_touching_beads(component, config) if _should_try_split(component, config) else [component]
-        accepted = False
-        for candidate in candidates:
-            if _is_valid_roi(candidate, config):
-                refined.append(candidate)
-                accepted = True
+        accepted_candidates, rejected_candidates = _evaluate_bead_components(
+            candidates, config, "primary", start_index=candidate_number
+        )
+        candidate_number += len(candidates)
+        accepted = bool(accepted_candidates)
+        refined.extend(accepted_candidates)
+        rejected.extend(rejected_candidates)
         if accepted:
             continue
         salvaged = _salvage_roi_by_opening(component, config, config.analyzer.bead_hole_area)
@@ -512,8 +638,11 @@ def _refine_bead_components(components: list[np.ndarray], config: CoverageViewer
                 "solidity={solidity:.3f}, anisotropy={anisotropy_ratio:.3f}".format(**stats)
             )
         suffix = f" Largest rejected components: {'; '.join(details)}." if details else ""
-        raise SegmentationError(f"Bead segmentation failed: no valid bead-like ROI remained after filtering.{suffix}")
-    return refined
+        message = f"Bead segmentation failed: no valid bead-like ROI remained after filtering.{suffix}"
+        if collect_diagnostics:
+            raise _ROIRefinementFailure(message, rejected)
+        raise SegmentationError(message)
+    return (refined, rejected) if collect_diagnostics else refined
 
 
 def _segment_ag_coverage(
@@ -597,10 +726,17 @@ def _measure_bead(bead_mask: np.ndarray, pixel_size_m: Optional[float]) -> BeadM
 
     eqd_px = float(region.equivalent_diameter_area)
     eqd_m = _scaled(eqd_px)
+    # Coverage uses the same X/Y bounding-box diameters shown by the viewer.
+    # This is deliberately separate from equivalent diameter and major/minor.
+    sphere_diameter_px = float((x_px + y_px) / 2.0)
+    sphere_radius_px = float(sphere_diameter_px / 2.0)
+    sphere_diameter_m = _scaled(sphere_diameter_px)
+    sphere_radius_m = _scaled(sphere_radius_px)
     sphere_area = None
-    if eqd_m is not None:
-        radius_m = eqd_m / 2.0
-        sphere_area = float(4.0 * math.pi * radius_m * radius_m)
+    sphere_volume = None
+    if sphere_radius_m is not None:
+        sphere_area = float(4.0 * math.pi * sphere_radius_m * sphere_radius_m)
+        sphere_volume = float((4.0 / 3.0) * math.pi * sphere_radius_m**3)
 
     return BeadMetrics(
         centroid_rc=(float(region.centroid[0]), float(region.centroid[1])),
@@ -617,6 +753,11 @@ def _measure_bead(bead_mask: np.ndarray, pixel_size_m: Optional[float]) -> BeadM
         anisotropy_ratio=float(anisotropy),
         solidity=float(region.solidity),
         sphere_surface_area_m2=sphere_area,
+        sphere_diameter_px=sphere_diameter_px,
+        sphere_diameter_m=sphere_diameter_m,
+        sphere_radius_px=sphere_radius_px,
+        sphere_radius_m=sphere_radius_m,
+        sphere_volume_m3=sphere_volume,
     )
 
 
@@ -679,7 +820,7 @@ def _build_roi_result(
     analyzer._viewer_coverage_closing_radius = int(config.ag_coverage_closing_radius)
     analyzer._viewer_coverage_use_union_with_count = bool(config.ag_coverage_use_union_with_count)
     ag_mask, coverage_feat, coverage_thr = _segment_ag_coverage(analyzer, cropped, bead_mask, count_mask, count_feat, count_thr, config)
-    coverage = analyzer._compute_coverage(bead_mask, ag_mask)
+    legacy_coverage = analyzer._compute_coverage(bead_mask, ag_mask)
     projected_ag_count = analyzer._count_ag_peaks(count_feat, count_mask, count_thr)
     ag_peak_coords = peak_local_max(
         count_feat,
@@ -689,6 +830,22 @@ def _build_roi_result(
         exclude_border=False,
     )
     bead_metrics = _measure_bead(bead_mask, pixel_size_m)
+    cap_metrics = compute_coverage_cap_metrics(
+        bead_mask,
+        ag_mask,
+        bead_metrics.centroid_rc,
+        bead_metrics.sphere_radius_px,
+        config.coverage_cap_radius_fraction,
+        pixel_size_m,
+        compute_surface_weighted=config.coverage_cap_surface_weighting_enabled,
+        min_completeness=config.coverage_cap_min_completeness,
+    )
+    if config.coverage_cap_enabled and cap_metrics.valid and cap_metrics.projected_coverage is not None:
+        coverage = float(cap_metrics.projected_coverage)
+        selected_method = "cap_projected"
+    else:
+        coverage = float(legacy_coverage)
+        selected_method = "legacy_full_projected"
     sphere_count_est = float(projected_ag_count * 2.0)
     density_per_um2 = None
     if bead_metrics.sphere_surface_area_m2 and bead_metrics.sphere_surface_area_m2 > 0:
@@ -713,31 +870,126 @@ def _build_roi_result(
         bead_area_px=int(bead_mask.sum()),
         ag_area_px=int(ag_mask.sum()),
         bead_metrics=bead_metrics,
+        legacy_full_projected_coverage=float(legacy_coverage),
+        legacy_full_projected_coverage_percent=float(legacy_coverage * 100.0),
+        cap_metrics=cap_metrics,
+        cap_projected_coverage=cap_metrics.projected_coverage,
+        cap_projected_coverage_percent=(
+            float(cap_metrics.projected_coverage * 100.0)
+            if cap_metrics.projected_coverage is not None
+            else None
+        ),
+        cap_surface_weighted_coverage=cap_metrics.surface_weighted_coverage,
+        cap_surface_weighted_coverage_percent=(
+            float(cap_metrics.surface_weighted_coverage * 100.0)
+            if cap_metrics.surface_weighted_coverage is not None
+            else None
+        ),
+        selected_coverage_method=selected_method,
     )
 
 
-def analyze_coverage_image(image_path: str | Path, config: CoverageViewerConfig) -> CoverageImageResult:
+def analyze_coverage_image(
+    image_path: str | Path,
+    config: CoverageViewerConfig,
+    *,
+    collect_diagnostics: bool = False,
+) -> CoverageImageResult:
+    """Run the production coverage pipeline, optionally retaining ROI failures.
+
+    ``collect_diagnostics`` changes failure reporting only.  The segmentation,
+    filters, and accepted result construction are shared with regular analysis.
+    """
     image_path = Path(image_path)
     analyzer = SEMCoverageAnalyzer(config.analyzer)
     raw, cropped, norm, display, metadata, crop_row = _load_preprocessed_image(image_path, analyzer, config)
+    primary_error: str | None = None
+    fallback_error: str | None = None
+    rejected: list[RejectedBeadCandidate] = []
+    bead_raw_union = np.zeros(cropped.shape, dtype=bool)
+    accepted_union = np.zeros(cropped.shape, dtype=bool)
     try:
-        bead_components = _segment_bead_components(analyzer, norm, config.min_bead_area_px)
-        bead_raw_union = np.zeros(cropped.shape, dtype=bool)
-        for component in bead_components:
+        raw_components = _segment_bead_components(analyzer, norm, config.min_bead_area_px)
+        for component in raw_components:
             bead_raw_union |= component
         try:
-            bead_components = _refine_bead_components(bead_components, config)
-        except SegmentationError:
+            if collect_diagnostics:
+                bead_components, rejected = _refine_bead_components(
+                    raw_components, config, collect_diagnostics=True
+                )
+            else:
+                bead_components = _refine_bead_components(raw_components, config)
+            for component in bead_components:
+                accepted_union |= component
+        except SegmentationError as exc:
+            if isinstance(exc, _ROIRefinementFailure):
+                rejected = list(exc.rejected)
+            primary_error = str(exc)
             if not config.bead_morph_fallback:
                 raise
-            bead_components = _segment_bead_by_morphology(analyzer, cropped, config)
-    except SegmentationError:
+            try:
+                fallback_result = _segment_bead_by_morphology(analyzer, cropped, config, collect_diagnostics=collect_diagnostics)
+                if collect_diagnostics:
+                    bead_components, fallback_rejected, fallback_raw = fallback_result
+                    rejected.extend(fallback_rejected)
+                    bead_raw_union = fallback_raw
+                else:
+                    bead_components = fallback_result
+                accepted_union = np.zeros(cropped.shape, dtype=bool)
+                for component in bead_components:
+                    accepted_union |= component
+            except SegmentationError as fallback_exc:
+                fallback_error = str(fallback_exc)
+                raise fallback_exc
+    except SegmentationError as exc:
+        primary_error = primary_error or str(exc)
         if not config.bead_morph_fallback:
+            if collect_diagnostics:
+                rejected_union = np.zeros(cropped.shape, dtype=bool)
+                for candidate in rejected:
+                    rejected_union |= candidate.mask
+                diagnostics = CoverageSegmentationDiagnostics(
+                    stage="primary", raw_candidate_union=bead_raw_union,
+                    accepted_candidate_union=accepted_union,
+                    rejected_candidate_union=rejected_union,
+                    rejected_candidates=tuple(rejected), primary_error=primary_error,
+                )
+                preview = FailedImagePreview(image_path, cropped, norm, display, metadata, int(crop_row))
+                raise CoverageSegmentationFailure(str(exc), preview, diagnostics) from exc
             raise
-        bead_components = _segment_bead_by_morphology(analyzer, cropped, config)
-        bead_raw_union = np.zeros(cropped.shape, dtype=bool)
-        for component in bead_components:
-            bead_raw_union |= component
+        try:
+            fallback_result = _segment_bead_by_morphology(analyzer, cropped, config, collect_diagnostics=collect_diagnostics)
+            if collect_diagnostics:
+                bead_components, fallback_rejected, fallback_raw = fallback_result
+                rejected.extend(fallback_rejected)
+                bead_raw_union = fallback_raw
+            else:
+                bead_components = fallback_result
+            if not collect_diagnostics:
+                bead_raw_union = np.zeros(cropped.shape, dtype=bool)
+            accepted_union = np.zeros(cropped.shape, dtype=bool)
+            for component in bead_components:
+                if not collect_diagnostics:
+                    bead_raw_union |= component
+                accepted_union |= component
+        except SegmentationError as fallback_exc:
+            fallback_error = str(fallback_exc)
+            if collect_diagnostics:
+                rejected_union = np.zeros(cropped.shape, dtype=bool)
+                for candidate in rejected:
+                    rejected_union |= candidate.mask
+                diagnostics = CoverageSegmentationDiagnostics(
+                    stage="fallback", raw_candidate_union=bead_raw_union,
+                    accepted_candidate_union=accepted_union,
+                    rejected_candidate_union=rejected_union,
+                    rejected_candidates=tuple(rejected), primary_error=primary_error,
+                    fallback_error=fallback_error,
+                )
+                preview = FailedImagePreview(image_path, cropped, norm, display, metadata, int(crop_row))
+                raise CoverageSegmentationFailure(
+                    "No valid bead ROI survived primary segmentation or morphology fallback.", preview, diagnostics
+                ) from fallback_exc
+            raise
     bead_refined_union = np.zeros(cropped.shape, dtype=bool)
     for component in bead_components:
         bead_refined_union |= component
@@ -752,6 +1004,18 @@ def analyze_coverage_image(image_path: str | Path, config: CoverageViewerConfig)
             ag_coverage_feature_union = np.maximum(ag_coverage_feature_union, roi.coverage_feature.astype(np.float32))
         except SegmentationError:
             continue
+    rejected_union = np.zeros(cropped.shape, dtype=bool)
+    for candidate in rejected:
+        rejected_union |= candidate.mask
+    diagnostics = CoverageSegmentationDiagnostics(
+        stage="accepted",
+        raw_candidate_union=bead_raw_union,
+        accepted_candidate_union=bead_refined_union,
+        rejected_candidate_union=rejected_union,
+        rejected_candidates=tuple(rejected),
+        primary_error=primary_error,
+        fallback_error=fallback_error,
+    ) if collect_diagnostics else None
     return CoverageImageResult(
         image_path=image_path,
         raw=raw,
@@ -766,6 +1030,7 @@ def analyze_coverage_image(image_path: str | Path, config: CoverageViewerConfig)
         ag_coverage_feature_union=ag_coverage_feature_union,
         crop_row=int(crop_row),
         config=config,
+        diagnostics=diagnostics,
     )
 
 
@@ -860,6 +1125,11 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "included_in_global_summary": bool(include_in_global),
                     "coverage": _safe_float(roi.coverage),
                     "coverage_percent": _safe_float(roi.coverage_percent),
+                    "legacy_full_projected_coverage_percent": _safe_float(roi.legacy_full_projected_coverage_percent),
+                    "cap_projected_coverage_percent": _safe_float(roi.cap_projected_coverage_percent),
+                    "cap_surface_weighted_coverage_percent": _safe_float(roi.cap_surface_weighted_coverage_percent),
+                    "selected_coverage_percent": _safe_float(roi.coverage_percent),
+                    "selected_coverage_method": roi.selected_coverage_method,
                     "projected_ag_count": int(roi.projected_ag_count),
                     "sphere_ag_count_est": _safe_float(roi.sphere_ag_count_est),
                     "sphere_np_density_per_um2": _safe_float(roi.sphere_np_density_per_um2),
@@ -869,10 +1139,26 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "bead_area_px": int(roi.bead_area_px),
                     "ag_area_px": int(roi.ag_area_px),
                     "bead_eq_diameter_m": _safe_float(roi.bead_metrics.equivalent_diameter_m),
+                    "sphere_diameter_px": _safe_float(roi.bead_metrics.sphere_diameter_px),
+                    "sphere_diameter_m": _safe_float(roi.bead_metrics.sphere_diameter_m),
+                    "sphere_radius_px": _safe_float(roi.bead_metrics.sphere_radius_px),
+                    "sphere_radius_m": _safe_float(roi.bead_metrics.sphere_radius_m),
+                    "sphere_surface_area_m2": _safe_float(roi.bead_metrics.sphere_surface_area_m2),
+                    "sphere_volume_m3": _safe_float(roi.bead_metrics.sphere_volume_m3),
                     "bead_x_diameter_m": _safe_float(roi.bead_metrics.x_diameter_m),
                     "bead_y_diameter_m": _safe_float(roi.bead_metrics.y_diameter_m),
                     "bead_anisotropy_ratio": _safe_float(roi.bead_metrics.anisotropy_ratio),
                     "bead_solidity": _safe_float(roi.bead_metrics.solidity),
+                    "coverage_cap_enabled": bool(config.coverage_cap_enabled),
+                    "coverage_cap_radius_fraction": float(config.coverage_cap_radius_fraction),
+                    "coverage_cap_projected_radius_px": _safe_float(roi.cap_metrics.geometry.cap_radius_px) if roi.cap_metrics else None,
+                    "coverage_cap_projected_radius_m": _safe_float(roi.cap_metrics.cap_radius_m) if roi.cap_metrics else None,
+                    "coverage_cap_half_angle_deg": _safe_float(roi.cap_metrics.geometry.half_angle_deg) if roi.cap_metrics else None,
+                    "coverage_cap_height_m": _safe_float(roi.cap_metrics.height_m) if roi.cap_metrics else None,
+                    "coverage_cap_projected_area_m2": _safe_float(roi.cap_metrics.projected_area_m2) if roi.cap_metrics else None,
+                    "coverage_cap_surface_area_m2": _safe_float(roi.cap_metrics.surface_area_m2) if roi.cap_metrics else None,
+                    "coverage_cap_completeness": _safe_float(roi.cap_metrics.geometry.completeness) if roi.cap_metrics else None,
+                    "coverage_cap_valid": bool(roi.cap_metrics.valid) if roi.cap_metrics else False,
                 }
             )
             if not include_in_global:
