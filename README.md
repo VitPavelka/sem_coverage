@@ -333,7 +333,11 @@ Beads only:
 
 ```bat
 python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --outputs-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --bead-config sem_bead_viewer_config.json --outputs-dir outputs
 ```
+
+`--bead-config` selects the bead-analysis configuration template. It does not
+modify that source configuration file.
 
 Coverage only:
 
@@ -357,11 +361,71 @@ Optional arguments:
 - `--sort-by {name,path,none}` - control deterministic natural sorting,
 - `--no-export` - create per-sample JSON and overlay PNG files but skip final table/histogram generation,
 - `--no-csv`, `--no-bead-csv`, and `--no-coverage-csv` - suppress only CSV files,
-- `--no-histograms` - keep summary tables but skip bead histograms.
+- `--no-histograms` - keep summary tables but do not write bead histogram PNG files or their matching one-column TXT source-data files.
 
 Typical outputs include per-sample JSON, `size_png`, `coverage_png`,
 `bead_global_summaries.csv`, `coverage_global_summaries.csv`,
 `sem_global_summaries.xlsx`, and `bead_histograms`.
+
+#### Bead histogram source data
+
+Bead histogram export automatically writes the exact numerical size vector
+used to construct each histogram. No additional CLI switch is required. The
+metric is the mean of the measured X and Y bead dimensions:
+
+```text
+mean_xy_diameter = (x_diameter + y_diameter) / 2
+```
+
+This is not equivalent diameter. Only valid beads included in the matching
+histogram are written to the data file.
+
+For each bead summary, the exporter creates a PNG/TXT pair in
+`<outputs-dir>/bead_histograms/`:
+
+```text
+<sample>_bead_mean_xy_diameter_um_histogram.png
+<sample>_bead_mean_xy_diameter_um_values.txt
+```
+
+For data without physical calibration, the corresponding files use pixel
+units:
+
+```text
+<sample>_bead_mean_xy_diameter_px_histogram.png
+<sample>_bead_mean_xy_diameter_px_values.txt
+```
+
+Combined batch outputs use the same convention:
+
+```text
+all_bead_mean_xy_diameter_um_histogram.png
+all_bead_mean_xy_diameter_um_values.txt
+```
+
+or the corresponding `_px_` filenames when calibration is unavailable.
+
+Each TXT file is UTF-8 plain text with one column and one value per line. It
+begins with either `mean_xy_diameter_um` or `mean_xy_diameter_px`, and contains
+exactly the same valid size vector supplied to the matching histogram. The
+files can be opened directly in Excel, Origin, Python, R, or other statistics
+software.
+
+```text
+mean_xy_diameter_um
+1.2384
+1.1942
+1.2715
+1.2250
+```
+
+Normal bead export writes both the histogram PNG and its matching values TXT.
+`--no-export` skips final tables, histograms, and histogram-value TXT files.
+`--no-histograms` skips both bead histogram PNG files and their matching TXT
+files. `--table-format` controls CSV/XLSX summary tables only; it does not
+control histogram source-data TXT files. `export_output_summaries.py` can
+regenerate both histogram PNG and matching TXT files from existing bead JSON
+summaries.
 
 ### 8.2 TEM batch export
 

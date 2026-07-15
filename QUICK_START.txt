@@ -65,6 +65,11 @@ OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
     python batch_export_tem_protocols.py --root "C:/Data/TEM" --outputs-dir outputs_tem --table-format xlsx
     python export_output_summaries.py --outputs-dir outputs --table-format both
 
+    Bead batch export also writes a one-column *_values.txt file beside every
+    bead histogram. It contains exactly the valid mean X/Y bead diameters used
+    by that histogram, for example:
+    outputs/bead_histograms/sample_01_bead_mean_xy_diameter_um_values.txt
+
     --table-format csv   keeps the current CSV behavior
     --table-format xlsx  writes only Excel workbooks
     --table-format both  writes both CSV and XLSX
