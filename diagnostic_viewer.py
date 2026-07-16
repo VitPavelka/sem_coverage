@@ -47,6 +47,9 @@ from sem_bead_viewer import (
     _format_length_m,
     _nice_scale_length_m,
     analyze_bead_image,
+    bead_size_metric_label,
+    normalize_size_distribution_metric,
+    valid_bead_size_vectors,
     load_app_config,
 )
 from sem_coverage_viewer import (
@@ -74,7 +77,7 @@ from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer
 
 LOGGER = logging.getLogger(__name__)
 
-ParameterKind = Literal["float", "int", "bool", "range", "text"]
+ParameterKind = Literal["float", "int", "bool", "range", "text", "choice"]
 ActivityPredicate = Callable[[Any], tuple[bool, str] | bool]
 ConditionalNote = Callable[[Any], str | None]
 
@@ -95,6 +98,7 @@ class ParameterSpec:
     requires_analysis: bool
     help_text: str
     text_parser: Callable[[str], Any] | None = None
+    choices: tuple[tuple[str, str], ...] | None = None
     format_value: Callable[[Any], str] | None = None
     placeholder: str | None = None
     active_when: ActivityPredicate | None = None
@@ -329,6 +333,7 @@ def _spec(
     config_paths: tuple[tuple[str, ...], ...] | None = None,
     requires_analysis: bool = True,
     text_parser: Callable[[str], Any] | None = None,
+    choices: tuple[tuple[str, str], ...] | None = None,
     format_value: Callable[[Any], str] | None = None,
     placeholder: str | None = None,
     active_when: ActivityPredicate | None = None,
@@ -347,6 +352,7 @@ def _spec(
         requires_analysis=requires_analysis,
         help_text=help_text,
         text_parser=text_parser,
+        choices=choices,
         format_value=format_value,
         placeholder=placeholder,
         active_when=active_when,
@@ -545,6 +551,18 @@ class BeadsDiagnosticAdapter:
                 "raise the high limit to retain larger objects.",
                 config_names=("min_diameter_px", "max_diameter_px"),
             ),
+            _spec(
+                "size_distribution_metric", "Size distribution metric", "Morphology and size", "choice",
+                None, None, None,
+                "Selects the scalar used for reported bead distributions, statistics, and global MAD "
+                "size-outlier rejection. It does not affect segmentation, equivalent-diameter filters, "
+                "or X/Y overlays.",
+                requires_analysis=True,
+                choices=(
+                    ("equivalent_diameter", "Equivalent diameter"),
+                    ("mean_xy_diameter", "Mean X/Y diameter"),
+                ),
+            ),
         ),
         "Watershed splitting": (
             _spec(
@@ -721,6 +739,8 @@ class BeadsDiagnosticAdapter:
                 elif spec.kind == "text":
                     parsed = spec.text_parser(value) if spec.text_parser else value
                     config = _replace_by_path(config, paths[0], parsed)
+                elif spec.kind == "choice":
+                    config = _replace_by_path(config, paths[0], str(value))
                 else:
                     config = _replace_by_path(config, paths[0], float(value))
         return config
@@ -728,6 +748,10 @@ class BeadsDiagnosticAdapter:
     def validate_config(
         self, config: ViewerConfig, image_path: Path | None = None
     ) -> str | None:
+        try:
+            normalize_size_distribution_metric(config.size_distribution_metric)
+        except ValueError as exc:
+            return str(exc)
         if config.infobar_tail_rows < 1 or config.infobar_min_run < 1:
             return "Infobar row counts must be positive."
         if config.infobar_k_mad <= 0:
@@ -886,30 +910,25 @@ class BeadsDiagnosticAdapter:
         roi_selection: int | None = None,
         current_config: ViewerConfig | None = None,
     ) -> str:
+        config = current_config or ViewerConfig()
+        metric = normalize_size_distribution_metric(config.size_distribution_metric)
         valid = [measurement for measurement in result.measurements if measurement.valid]
         rejected = len(result.measurements) - len(valid)
-        physical = [
-            measurement.mean_diameter_m
-            for measurement in valid
-            if measurement.mean_diameter_m is not None
-        ]
-        if physical:
+        physical, pixels = valid_bead_size_vectors(valid, metric)
+        metric_text = "equivalent diameter" if metric == "equivalent_diameter" else "mean X/Y diameter"
+        if physical.size:
             mean_text = _format_length_m(float(np.mean(physical)))
             median_text = _format_length_m(float(np.median(physical)))
         else:
-            pixels = [
-                (measurement.x_diameter_px + measurement.y_diameter_px) / 2.0
-                for measurement in valid
-            ]
-            mean_text = f"{float(np.mean(pixels)):.2f} px" if pixels else "n/a"
-            median_text = f"{float(np.median(pixels)):.2f} px" if pixels else "n/a"
+            mean_text = f"{float(np.mean(pixels)):.2f} px" if pixels.size else "n/a"
+            median_text = f"{float(np.median(pixels)):.2f} px" if pixels.size else "n/a"
         pixel_text = (
             f" | pixel {_format_length_m(result.metadata.mean_pixel_size_m)}/px"
             if result.metadata.mean_pixel_size_m
             else ""
         )
         return (
-            f"Candidates {len(result.measurements)} | valid {len(valid)} | rejected {rejected} | "
+            f"Size metric {metric_text} | Candidates {len(result.measurements)} | valid {len(valid)} | rejected {rejected} | "
             f"mean {mean_text} | median {median_text} | analysis {duration_s:.3f} s{pixel_text}"
         )
 
@@ -2750,7 +2769,7 @@ class AnalysisController:
 class _Control:
     spec: ParameterSpec
     axis: Axes
-    widget: Slider | RangeSlider | CheckButtons | TextBox
+    widget: Slider | RangeSlider | CheckButtons | TextBox | RadioButtons
     callback_id: int | None = None
     enabled: bool = True
     inactive_reason: str = ""
@@ -3018,7 +3037,7 @@ class DiagnosticViewer:
                     parameter, new_value
                 )
             )
-            if spec.kind == "bool":
+            if spec.kind in {"bool", "choice"}:
                 callback_id = widget.on_clicked(callback)
             elif spec.kind == "text":
                 callback_id = widget.on_submit(callback)
@@ -3030,7 +3049,7 @@ class DiagnosticViewer:
 
     def _create_control_widget(
         self, axis: Axes, spec: ParameterSpec, value: Any
-    ) -> Slider | RangeSlider | CheckButtons | TextBox:
+    ) -> Slider | RangeSlider | CheckButtons | TextBox | RadioButtons:
         if spec.kind == "range":
             current_low, current_high = value
             minimum = min(float(spec.minimum), float(current_low))
@@ -3062,6 +3081,17 @@ class DiagnosticViewer:
                     fontsize=6.5,
                     color="0.45",
                 )
+            return widget
+        if spec.kind == "choice":
+            if not spec.choices:
+                raise ValueError(f"Choice control '{spec.name}' has no choices.")
+            labels = [label for _stored, label in spec.choices]
+            stored = [stored_value for stored_value, _label in spec.choices]
+            active = stored.index(str(value)) if str(value) in stored else 0
+            axis.set_title(spec.label, fontsize=8, pad=1.0, loc="left")
+            widget = RadioButtons(axis, labels, active=active, activecolor="#2878b5")
+            for text in widget.labels:
+                text.set_fontsize(7)
             return widget
         if spec.kind == "range":
             widget = RangeSlider(
@@ -3150,6 +3180,11 @@ class DiagnosticViewer:
             return tuple(value)
         if spec.kind == "text":
             return str(value)
+        if spec.kind == "choice":
+            for stored, label in spec.choices or ():
+                if value == label:
+                    return stored
+            return str(value)
         return value
 
     def _current_valid_config(self) -> Any | None:
@@ -3192,7 +3227,7 @@ class DiagnosticViewer:
                 LOGGER.debug("Could not set widget active state", exc_info=True)
         if hasattr(widget, "eventson"):
             widget.eventson = bool(enabled)
-        if hasattr(widget, "set_active") and not isinstance(widget, CheckButtons):
+        if hasattr(widget, "set_active") and not isinstance(widget, (CheckButtons, RadioButtons)):
             try:
                 widget.set_active(bool(enabled))
             except Exception:
@@ -3844,6 +3879,13 @@ class DiagnosticViewer:
             current = bool(control.widget.get_status()[0])
             if current != bool(value):
                 control.widget.set_active(0)
+        elif control.spec.kind == "choice":
+            choices = control.spec.choices or ()
+            stored = [stored_value for stored_value, _label in choices]
+            if str(value) in stored:
+                desired = stored.index(str(value))
+                if control.widget.value_selected != choices[desired][1]:
+                    control.widget.set_active(desired)
         elif control.spec.kind == "text":
             control.widget.set_val(str(value))
         else:

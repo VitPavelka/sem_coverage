@@ -19,6 +19,7 @@
     "diameter_size_limits": false,
     "min_diameter_px": 14.0,
     "max_diameter_px": 60.0,
+    "size_distribution_metric": "mean_xy_diameter",
     "peak_min_distance_px": 8,
     "peak_threshold_px": 3.5,
     "use_watershed_split": true,

@@ -66,8 +66,8 @@ OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
     python export_output_summaries.py --outputs-dir outputs --table-format both
 
     Bead batch export also writes a one-column *_values.txt file beside every
-    bead histogram. It contains exactly the valid mean X/Y bead diameters used
-    by that histogram, for example:
+    bead histogram. It contains exactly the valid sizes selected by
+    size_distribution_metric (mean X/Y diameter by default), for example:
     outputs/bead_histograms/sample_01_bead_mean_xy_diameter_um_values.txt
 
     --table-format csv   keeps the current CSV behavior

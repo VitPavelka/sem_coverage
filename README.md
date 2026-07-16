@@ -371,14 +371,31 @@ Typical outputs include per-sample JSON, `size_png`, `coverage_png`,
 
 Bead histogram export automatically writes the exact numerical size vector
 used to construct each histogram. No additional CLI switch is required. The
-metric is the mean of the measured X and Y bead dimensions:
+metric is selected with `size_distribution_metric` in the bead configuration.
+The default is mean X/Y diameter:
 
 ```text
 mean_xy_diameter = (x_diameter + y_diameter) / 2
 ```
 
-This is not equivalent diameter. Only valid beads included in the matching
-histogram are written to the data file.
+`equivalent_diameter` remains available as an alternative. It is the diameter
+of a circle with the segmented bead area:
+
+```text
+equivalent_diameter = 2 * sqrt(area / pi)
+```
+
+The selection affects distributions and summary statistics only. It does not
+change segmentation, equivalent-diameter acceptance filters, or X/Y overlay
+diagnostics. Only valid beads included in the matching histogram are written
+to the data file.
+
+Mean X/Y diameter is the current default because, for this dataset and this
+implementation, it has been empirically less sensitive to local area loss
+when touching beads are imperfectly separated by watershed. This is a
+dataset- and implementation-specific robustness consideration, not a general
+claim that mean X/Y diameter is always more accurate. Both X/Y dimensions and
+equivalent diameter remain available in the outputs for comparison.
 
 For each bead summary, the exporter creates a PNG/TXT pair in
 `<outputs-dir>/bead_histograms/`:
@@ -396,6 +413,9 @@ units:
 <sample>_bead_mean_xy_diameter_px_values.txt
 ```
 
+When `size_distribution_metric` is `equivalent_diameter`, the corresponding
+filenames use `equivalent_diameter` instead of `mean_xy_diameter`.
+
 Combined batch outputs use the same convention:
 
 ```text
@@ -405,11 +425,12 @@ all_bead_mean_xy_diameter_um_values.txt
 
 or the corresponding `_px_` filenames when calibration is unavailable.
 
-Each TXT file is UTF-8 plain text with one column and one value per line. It
-begins with either `mean_xy_diameter_um` or `mean_xy_diameter_px`, and contains
-exactly the same valid size vector supplied to the matching histogram. The
-files can be opened directly in Excel, Origin, Python, R, or other statistics
-software.
+Each TXT file is UTF-8 plain text with one column and one value per line. Its
+header identifies the selected metric and unit, for example
+`mean_xy_diameter_um`, `mean_xy_diameter_px`, `equivalent_diameter_um`, or
+`equivalent_diameter_px`. It contains exactly the same valid size vector supplied
+to the matching histogram. The files can be opened directly in Excel, Origin,
+Python, R, or other statistics software.
 
 ```text
 mean_xy_diameter_um
@@ -477,6 +498,7 @@ This tool detects **bright beads on a darker background**, measures x/y dimensio
 | `diameter_size_limits` = `false`       | Enables minimum and maximum equivalent-diameter filtering.                                          | Set to `false` during diagnosis. It changes acceptance into statistics, not the initial segmentation.                                      |
 | `min_diameter_px` = `14.0`             | Smallest accepted equivalent diameter in pixels.                                                    | Decrease for smaller beads. Active only when `diameter_size_limits=true`                                                                   |
 | `max_diameter_px` = `60.0`             | Largest accepted equivalent diameter in pixels.                                                     | Increase for larger beads. Too low a value marks valid objects red.                                                                        |
+| `size_distribution_metric` = `"mean_xy_diameter"` | Scalar used for bead histograms and summary statistics: `mean_xy_diameter` or `equivalent_diameter`. | Default `mean_xy_diameter` is `(d_x + d_y) / 2`, the mean full horizontal/vertical mask extent. It is the current dataset-specific default because it is empirically less sensitive to local watershed area loss for imperfectly separated touching beads; this is not a universal accuracy claim. Optional `equivalent_diameter` is `2 * sqrt(A / pi)`, the diameter of a circle with the segmented bead area. This reporting choice does not affect segmentation or existing equivalent-diameter filters; X/Y dimensions remain available for anisotropy and overlays. |
 | `peak_min_distance_px` = `8`           | Reserved parameter for peak detection.                                                              | Not used by the current code; changing it has no effect.                                                                                   |
 | `peak_threshold_px` = `3.5`            | Reserved parameter for peak detection.                                                              | Not used by the current code; changing it has no effect.                                                                                   |
 | `use watershed_split` = `true`         | Enables watershed separation of connected bead candidates.                                          | Disable if single beads are over-split. Enable when touching beads are counted as one.                                                     |

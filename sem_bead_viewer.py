@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import configparser
 import json
@@ -26,6 +26,29 @@ from path_utils import expand_user_path, path_to_config_text, resolve_existing_i
 from tabular_export import sort_paths
 
 
+BEAD_SIZE_METRICS = ("equivalent_diameter", "mean_xy_diameter")
+
+
+def normalize_size_distribution_metric(metric: str) -> str:
+    """Validate and normalize the reporting-only bead size metric name."""
+
+    value = str(metric).strip().casefold()
+    if value not in BEAD_SIZE_METRICS:
+        raise ValueError(
+            f"Unsupported bead size_distribution_metric {metric!r}. "
+            "Supported values: equivalent_diameter, mean_xy_diameter."
+        )
+    return value
+
+
+def bead_size_metric_label(metric: str, unit: str) -> str:
+    """Return the user-facing axis label for a validated size metric."""
+
+    normalized = normalize_size_distribution_metric(metric)
+    prefix = "Equivalent diameter" if normalized == "equivalent_diameter" else "Mean X/Y diameter"
+    return f"{prefix} [{unit}]"
+
+
 @dataclass(frozen=True)
 class ViewerConfig:
     infobar_tail_rows: int = 320
@@ -44,6 +67,7 @@ class ViewerConfig:
     diameter_size_limits: bool = True
     min_diameter_px: float = 14.0
     max_diameter_px: float = 60.0
+    size_distribution_metric: str = "mean_xy_diameter"
 
     peak_min_distance_px: int = 8
     peak_threshold_px: float = 3.5
@@ -131,10 +155,97 @@ class BeadMeasurement:
 
     @property
     def mean_diameter_m(self) -> Optional[float]:
+        """Backward-compatible alias for :attr:`mean_xy_diameter_m`."""
+
+        return self.mean_xy_diameter_m
+
+    @property
+    def mean_xy_diameter_px(self) -> float:
+        """Arithmetic mean of full horizontal and vertical mask extents."""
+
+        return float((self.x_diameter_px + self.y_diameter_px) / 2.0)
+
+    @property
+    def mean_xy_diameter_m(self) -> Optional[float]:
         vals = [v for v in (self.x_diameter_m, self.y_diameter_m) if v is not None]
         if not vals:
             return None
         return float(sum(vals) / len(vals))
+
+
+def bead_size_value_px(measurement: BeadMeasurement, metric: str) -> float:
+    """Return one reported bead-size value in pixels without changing validity."""
+
+    normalized = normalize_size_distribution_metric(metric)
+    if normalized == "equivalent_diameter":
+        return float(measurement.equivalent_diameter_px)
+    return measurement.mean_xy_diameter_px
+
+
+def bead_size_value_m(measurement: BeadMeasurement, metric: str) -> Optional[float]:
+    """Return one reported bead-size value in metres when calibrated."""
+
+    normalized = normalize_size_distribution_metric(metric)
+    if normalized == "equivalent_diameter":
+        return measurement.equivalent_diameter_m
+    return measurement.mean_xy_diameter_m
+
+
+def bead_size_vector_px(
+    measurements: Sequence[BeadMeasurement], metric: str
+) -> np.ndarray:
+    """Return the selected reporting-size vector for the supplied beads."""
+
+    normalized = normalize_size_distribution_metric(metric)
+    return np.asarray(
+        [bead_size_value_px(measurement, normalized) for measurement in measurements],
+        dtype=np.float64,
+    )
+
+
+def valid_bead_size_vectors(
+    measurements: Sequence[BeadMeasurement], metric: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return calibrated and pixel vectors for valid beads only."""
+
+    normalized = normalize_size_distribution_metric(metric)
+    valid = [measurement for measurement in measurements if measurement.valid]
+    values_px = bead_size_vector_px(valid, normalized)
+    values_m = np.asarray(
+        [value for measurement in valid if (value := bead_size_value_m(measurement, normalized)) is not None],
+        dtype=np.float64,
+    )
+    return values_m, values_px
+
+
+def robust_mad_zscores(values: np.ndarray) -> np.ndarray:
+    """Return robust z-scores from the median and median absolute deviation."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    median = float(np.median(array))
+    mad = float(np.median(np.abs(array - median)))
+    if mad <= 0:
+        return np.zeros(array.shape, dtype=np.float64)
+    return 0.6745 * np.abs(array - median) / mad
+
+
+def mad_outlier_flags(values: np.ndarray, zscore_limit: float) -> np.ndarray:
+    """Return robust MAD outlier flags for one already-selected size vector."""
+
+    return robust_mad_zscores(values) > float(zscore_limit)
+
+
+def global_size_outlier_flags(
+    measurements: Sequence[BeadMeasurement], config: ViewerConfig
+) -> np.ndarray:
+    """Flag provisional candidates using the configured scalar size metric."""
+
+    selected_sizes = bead_size_vector_px(
+        measurements, config.size_distribution_metric
+    )
+    return mad_outlier_flags(selected_sizes, config.outlier_mad_zscore)
 
 
 @dataclass(frozen=True)
@@ -173,6 +284,12 @@ def load_app_config(config_path: str | Path) -> AppConfig:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     viewer_data = data.get("viewer", {})
     viewer = _dataclass_from_dict(ViewerConfig, viewer_data)
+    viewer = replace(
+        viewer,
+        size_distribution_metric=normalize_size_distribution_metric(
+            viewer.size_distribution_metric
+        ),
+    )
     return AppConfig(
         folder=data["folder"],
         viewer=viewer,
@@ -413,13 +530,33 @@ def _classify_measurements(
         shape = labels.shape
         return [], np.zeros(shape, dtype=bool), np.zeros(shape, dtype=bool)
 
-    diameters = np.array([m["equivalent_diameter_px"] for m in provisional], dtype=np.float64)
-    median = float(np.median(diameters))
-    mad = float(np.median(np.abs(diameters - median)))
-    if mad > 0:
-        robust_z = 0.6745 * np.abs(diameters - median) / mad
-    else:
-        robust_z = np.zeros_like(diameters)
+    # Global size outlier rejection is reporting-metric based.  Build neutral
+    # provisional measurements first so this path uses the same selected-size
+    # vector helper as statistics, summaries, and histograms.  Their final
+    # validity is determined below after every rejection rule is evaluated.
+    provisional_measurements = [
+        BeadMeasurement(
+            label_id=item["label_id"],
+            centroid_rc=item["centroid_rc"],
+            equivalent_diameter_px=item["equivalent_diameter_px"],
+            equivalent_diameter_m=(item["equivalent_diameter_px"] * pixel_size_m) if pixel_size_m else None,
+            x_diameter_px=item["x_diameter_px"],
+            y_diameter_px=item["y_diameter_px"],
+            x_diameter_m=(item["x_diameter_px"] * pixel_size_m) if pixel_size_m else None,
+            y_diameter_m=(item["y_diameter_px"] * pixel_size_m) if pixel_size_m else None,
+            area_px=item["area_px"],
+            bbox=item["bbox"],
+            solidity=item["solidity"],
+            eccentricity=item["eccentricity"],
+            edge_touched=item["edge_touched"],
+            anisotropic=item["anisotropic"],
+            global_outlier=False,
+            rejected=False,
+            reasons=(),
+        )
+        for item in provisional
+    ]
+    global_size_outliers = global_size_outlier_flags(provisional_measurements, cfg)
 
     measurements: list[BeadMeasurement] = []
     valid_mask = np.zeros(labels.shape, dtype=bool)
@@ -439,7 +576,7 @@ def _classify_measurements(
             reasons.append("low_solidity")
         if item["edge_touched"] and not cfg.include_edge_candidates:
             reasons.append("edge_touch")
-        if cfg.global_size_outliers and robust_z[idx] > cfg.outlier_mad_zscore:
+        if cfg.global_size_outliers and global_size_outliers[idx]:
             reasons.append("global_size_outlier")
             item["global_outlier"] = True
 
@@ -478,6 +615,8 @@ def _classify_measurements(
 
 
 def analyze_bead_image(image_path: str | Path, config: ViewerConfig = ViewerConfig()) -> BeadAnalysisResult:
+    # Validate reporting configuration centrally without affecting segmentation.
+    normalize_size_distribution_metric(config.size_distribution_metric)
     image_path = Path(image_path)
     hdr_path = _paired_hdr_path(image_path)
     metadata = _read_hdr_metadata(hdr_path) if hdr_path else SEMMetadata(None, None, None, None, "", "", "", "")
@@ -666,17 +805,24 @@ class BeadDatasetViewer:
         artists.clear()
 
     def _valid_diameters(self, res: BeadAnalysisResult) -> np.ndarray:
-        vals = [m.mean_diameter_m for m in res.measurements if m.valid and m.mean_diameter_m is not None]
-        return np.array(vals, dtype=np.float64)
+        """Backward-compatible calibrated selected-metric vector."""
+
+        values_m, _values_px = valid_bead_size_vectors(
+            res.measurements, self.config.size_distribution_metric
+        )
+        return values_m
+
+    def _valid_size_vectors(self, res: BeadAnalysisResult) -> tuple[np.ndarray, np.ndarray]:
+        return valid_bead_size_vectors(res.measurements, self.config.size_distribution_metric)
 
     def _update_hist(self, res: BeadAnalysisResult) -> None:
         self.ax_hist.clear()
-        vals_m = self._valid_diameters(res)
-        if vals_m.size:
-            vals_um = vals_m * 1e6
-            bins = min(max(5, vals_um.size // 2), 12)
-            self.ax_hist.hist(vals_um, bins=bins, color="#4cc9f0", edgecolor="#0b1f2a")
-            self.ax_hist.set_xlabel("Diameter [um]")
+        vals_m, vals_px = self._valid_size_vectors(res)
+        if vals_m.size or vals_px.size:
+            values, unit = (vals_m * 1e6, "µm") if vals_m.size else (vals_px, "px")
+            bins = min(max(5, values.size // 2), 12)
+            self.ax_hist.hist(values, bins=bins, color="#4cc9f0", edgecolor="#0b1f2a")
+            self.ax_hist.set_xlabel(bead_size_metric_label(self.config.size_distribution_metric, unit))
             self.ax_hist.set_ylabel("Count")
         else:
             self.ax_hist.text(0.5, 0.5, "No valid bead measurements", ha="center", va="center", transform=self.ax_hist.transAxes)
@@ -688,7 +834,8 @@ class BeadDatasetViewer:
         self.ax_info.clear()
         self.ax_info.axis("off")
 
-        valid_arr = self._valid_diameters(res)
+        valid_m, valid_px = self._valid_size_vectors(res)
+        valid_arr, unit = (valid_m, "m") if valid_m.size else (valid_px, "px")
         outlier_count = sum(1 for m in res.measurements if not m.valid)
 
         summary = [
@@ -697,19 +844,21 @@ class BeadDatasetViewer:
             f"Candidates: {len(res.measurements)}",
             f"Used for stats: {valid_arr.size}",
             f"Flagged red: {outlier_count}",
+            f"Size metric: {'equivalent diameter' if self.config.size_distribution_metric == 'equivalent_diameter' else 'mean X/Y diameter'}",
         ]
 
         if valid_arr.size:
-            mean_m = float(valid_arr.mean())
-            std_m = float(valid_arr.std(ddof=1)) if valid_arr.size > 1 else 0.0
-            sem_m = float(std_m / math.sqrt(valid_arr.size)) if valid_arr.size > 1 else 0.0
+            mean_value = float(valid_arr.mean())
+            std_value = float(valid_arr.std(ddof=1)) if valid_arr.size > 1 else 0.0
+            sem_value = float(std_value / math.sqrt(valid_arr.size)) if valid_arr.size > 1 else 0.0
+            format_value = _format_length_m if unit == "m" else lambda value: f"{value:.2f} px"
             summary.extend(
                 [
-                    f"Mean diameter: {_format_length_m(mean_m)}",
-                    f"SD: {_format_length_m(std_m)}",
-                    f"SEM: {_format_length_m(sem_m)}",
-                    f"Median: {_format_length_m(float(np.median(valid_arr)))}",
-                    f"Range: {_format_length_m(float(valid_arr.min()))} .. {_format_length_m(float(valid_arr.max()))}",
+                    f"Mean diameter: {format_value(mean_value)}",
+                    f"SD: {format_value(std_value)}",
+                    f"SEM: {format_value(sem_value)}",
+                    f"Median: {format_value(float(np.median(valid_arr)))}",
+                    f"Range: {format_value(float(valid_arr.min()))} .. {format_value(float(valid_arr.max()))}",
                 ]
             )
         else:
@@ -823,56 +972,99 @@ def build_bead_summary(folder: str | Path, config: ViewerConfig) -> dict:
     folder = Path(folder)
     image_paths = sort_paths(list(folder.glob("*.tif")))
     images = []
-    global_vals = []
+    metric = normalize_size_distribution_metric(config.size_distribution_metric)
+    global_values_m: list[float] = []
+    global_values_px: list[float] = []
+
+    def _stats(values: Sequence[float]) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        if not values:
+            return None, None, None, None
+        array = np.asarray(values, dtype=np.float64)
+        sd = float(np.std(array, ddof=1)) if array.size > 1 else 0.0
+        sem = float(sd / math.sqrt(array.size)) if array.size > 1 else 0.0
+        return float(np.mean(array)), float(np.median(array)), sd, sem
 
     for image_path in image_paths:
         res = analyze_bead_image(image_path, config)
         valid = [m for m in res.measurements if m.valid]
-        # The histogram source is the valid-bead mean X/Y diameter, not
-        # equivalent diameter.  Keep both calibrated and pixel vectors so an
-        # uncalibrated image can still be exported without changing filtering.
-        valid_pairs = [(m.mean_diameter_m, (m.x_diameter_px + m.y_diameter_px) / 2.0) for m in valid]
-        valid_diams = [diameter_m for diameter_m, _diameter_px in valid_pairs if diameter_m is not None]
-        valid_diams_px = [float(diameter_px) for _diameter_m, diameter_px in valid_pairs]
+        equivalent_px = [float(m.equivalent_diameter_px) for m in valid]
+        equivalent_m = [float(m.equivalent_diameter_m) for m in valid if m.equivalent_diameter_m is not None]
+        mean_xy_px = [m.mean_xy_diameter_px for m in valid]
+        mean_xy_m = [float(m.mean_xy_diameter_m) for m in valid if m.mean_xy_diameter_m is not None]
+        selected_m, selected_px = valid_bead_size_vectors(valid, metric)
+        selected_values_m = [float(value) for value in selected_m]
+        selected_values_px = [float(value) for value in selected_px]
+
+        mean_m, median_m, sd_m, sem_m = _stats(selected_values_m)
+        mean_px, median_px, sd_px, sem_px = _stats(selected_values_px)
         image_entry = {
             "file": image_path.name,
             "sample": image_path.parent.name,
             "crop_row": int(res.crop_row),
             "pixel_size_m": _safe_float(res.metadata.mean_pixel_size_m),
             "candidate_count": len(res.measurements),
-            "used_count": len(valid_diams),
-            "flagged_count": len(res.measurements) - len(valid_diams),
+            "used_count": len(valid),
+            "flagged_count": len(res.measurements) - len(valid),
             "date": res.metadata.date,
             "time": res.metadata.time,
             "device": res.metadata.device,
             "magnification": _safe_float(res.metadata.magnification),
-            "diameters_m": [_safe_float(v) for v in valid_diams],
-            "mean_xy_diameters_px": [_safe_float(v) for v in valid_diams_px],
-            "histogram_metric": "mean_xy_diameter",
-            "mean_diameter_m": _safe_float(float(np.mean(valid_diams))) if valid_diams else None,
-            "median_diameter_m": _safe_float(float(np.median(valid_diams))) if valid_diams else None,
-            "sd_diameter_m": _safe_float(float(np.std(valid_diams, ddof=1))) if len(valid_diams) > 1 else 0.0 if valid_diams else None,
-            "sem_diameter_m": _safe_float(float(np.std(valid_diams, ddof=1) / math.sqrt(len(valid_diams)))) if len(valid_diams) > 1 else 0.0 if valid_diams else None,
+            # ``diameters_m`` is retained as a backward-compatible selected
+            # calibrated vector; explicit vectors make new summaries unambiguous.
+            "diameters_m": [_safe_float(v) for v in selected_values_m],
+            "equivalent_diameters_px": [_safe_float(v) for v in equivalent_px],
+            "equivalent_diameters_m": [_safe_float(v) for v in equivalent_m],
+            "mean_xy_diameters_px": [_safe_float(v) for v in mean_xy_px],
+            "mean_xy_diameters_m": [_safe_float(v) for v in mean_xy_m],
+            "size_distribution_metric": metric,
+            "histogram_metric": metric,
+            "selected_diameters_px": [_safe_float(v) for v in selected_values_px],
+            "selected_diameters_m": [_safe_float(v) for v in selected_values_m],
+            "mean_diameter_m": _safe_float(mean_m),
+            "median_diameter_m": _safe_float(median_m),
+            "sd_diameter_m": _safe_float(sd_m),
+            "sem_diameter_m": _safe_float(sem_m),
+            "selected_mean_diameter_m": _safe_float(mean_m),
+            "selected_median_diameter_m": _safe_float(median_m),
+            "selected_sd_diameter_m": _safe_float(sd_m),
+            "selected_sem_diameter_m": _safe_float(sem_m),
+            "mean_diameter_px": _safe_float(mean_px),
+            "median_diameter_px": _safe_float(median_px),
+            "sd_diameter_px": _safe_float(sd_px),
+            "sem_diameter_px": _safe_float(sem_px),
             "flagged": [
                 {
                     "label_id": int(m.label_id),
                     "reasons": list(m.reasons),
-                    "mean_diameter_m": _safe_float(m.mean_diameter_m),
+                    "equivalent_diameter_m": _safe_float(m.equivalent_diameter_m),
+                    "mean_xy_diameter_m": _safe_float(m.mean_xy_diameter_m),
                 }
                 for m in res.measurements
                 if not m.valid
             ],
         }
         images.append(image_entry)
-        global_vals.extend([float(v) for v in valid_diams if v is not None and math.isfinite(v)])
+        global_values_m.extend(value for value in selected_values_m if math.isfinite(value))
+        global_values_px.extend(value for value in selected_values_px if math.isfinite(value))
+
+    global_mean_m, global_median_m, global_sd_m, global_sem_m = _stats(global_values_m)
+    global_mean_px, global_median_px, global_sd_px, global_sem_px = _stats(global_values_px)
 
     global_summary = {
         "image_count": len(images),
         "images_with_valid_measurements": sum(1 for image in images if image["used_count"] > 0),
-        "total_used_beads": len(global_vals),
-        "mean_diameter_m": _safe_float(float(np.mean(global_vals))) if global_vals else None,
-        "median_diameter_m": _safe_float(float(np.median(global_vals))) if global_vals else None,
-        "sd_diameter_m": _safe_float(float(np.std(global_vals, ddof=1))) if len(global_vals) > 1 else 0.0 if global_vals else None,
+        "total_used_beads": len(global_values_px),
+        "size_distribution_metric": metric,
+        "selected_diameters_px": [_safe_float(value) for value in global_values_px],
+        "selected_diameters_m": [_safe_float(value) for value in global_values_m],
+        "mean_diameter_m": _safe_float(global_mean_m),
+        "median_diameter_m": _safe_float(global_median_m),
+        "sd_diameter_m": _safe_float(global_sd_m),
+        "sem_diameter_m": _safe_float(global_sem_m),
+        "mean_diameter_px": _safe_float(global_mean_px),
+        "median_diameter_px": _safe_float(global_median_px),
+        "sd_diameter_px": _safe_float(global_sd_px),
+        "sem_diameter_px": _safe_float(global_sem_px),
     }
 
     return {

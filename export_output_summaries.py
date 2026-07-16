@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from path_utils import expand_user_path
+from sem_bead_viewer import BEAD_SIZE_METRICS, bead_size_metric_label, normalize_size_distribution_metric
 from tabular_export import natural_sort_key, sort_paths, write_csv_table, write_xlsx_workbook
 
 
@@ -71,7 +72,7 @@ def export_table_summaries(
             bead_csv_path = write_csv_table(
                 bead_rows,
                 outputs_dir / BEAD_CSV_NAME,
-                preferred_columns=("name", "json_file"),
+                preferred_columns=("name", "json_file", "size_distribution_metric"),
                 sort_by=sort_by,
             )
             if bead_csv_path is not None:
@@ -90,7 +91,7 @@ def export_table_summaries(
         preferred_columns: dict[str, tuple[str, ...]] = {}
         if bead and bead_rows:
             workbook_sheets["Beads"] = bead_rows
-            preferred_columns["Beads"] = ("name", "json_file")
+            preferred_columns["Beads"] = ("name", "json_file", "size_distribution_metric")
         if coverage and coverage_rows:
             workbook_sheets["Coverage"] = coverage_rows
             preferred_columns["Coverage"] = ("name", "json_file")
@@ -125,25 +126,56 @@ def export_csv_summaries(
     )
 
 
-def bead_histogram_values(data: dict) -> tuple[np.ndarray, str]:
-    """Return the exact valid mean-X/Y diameter vector used by a histogram."""
+def _summary_metric(data: dict) -> str:
+    """Resolve an explicit new metric or legacy mean-X/Y summary convention."""
 
-    vals_m = []
-    vals_px = []
+    for mapping in (data.get("global_summary", {}), data.get("viewer_config", {})):
+        if isinstance(mapping, dict) and mapping.get("size_distribution_metric"):
+            return normalize_size_distribution_metric(mapping["size_distribution_metric"])
+    images = data.get("images", [])
+    legacy_metric = next(
+        (image.get("histogram_metric") for image in images if isinstance(image, dict) and image.get("histogram_metric")),
+        None,
+    )
+    if legacy_metric == "mean_xy_diameter" or any(
+        isinstance(image, dict) and "mean_xy_diameters_px" in image for image in images
+    ):
+        return "mean_xy_diameter"
+    return "equivalent_diameter"
+
+
+def bead_histogram_values(data: dict) -> tuple[np.ndarray, str, str]:
+    """Return values, TXT header, and normalized metric for one bead summary."""
+
+    metric = _summary_metric(data)
+    vals_m: list[float] = []
+    vals_px: list[float] = []
+    key_m = f"{metric}s_m" if metric == "equivalent_diameter" else "mean_xy_diameters_m"
+    key_px = f"{metric}s_px" if metric == "equivalent_diameter" else "mean_xy_diameters_px"
     for image in data.get("images", []):
-        vals_m.extend(v for v in image.get("diameters_m", []) if v is not None)
-        vals_px.extend(v for v in image.get("mean_xy_diameters_px", []) if v is not None)
+        if not isinstance(image, dict):
+            continue
+        # New summaries carry explicit selected vectors. Old mean-X/Y
+        # summaries used ``diameters_m`` plus mean-X/Y pixel values.
+        values_m = image.get("selected_diameters_m")
+        values_px = image.get("selected_diameters_px")
+        if values_m is None:
+            values_m = image.get(key_m)
+            if values_m is None and metric == "mean_xy_diameter":
+                values_m = image.get("diameters_m", [])
+        if values_px is None:
+            values_px = image.get(key_px, [])
+        vals_m.extend(float(value) for value in values_m or [] if value is not None and math.isfinite(float(value)))
+        vals_px.extend(float(value) for value in values_px or [] if value is not None and math.isfinite(float(value)))
     if vals_m:
-        values = [float(v) * 1e6 for v in vals_m if math.isfinite(float(v))]
-        return np.array(values, dtype=np.float64), "mean_xy_diameter_um"
-    values = [float(v) for v in vals_px if math.isfinite(float(v))]
-    return np.array(values, dtype=np.float64), "mean_xy_diameter_px"
+        return np.asarray(vals_m, dtype=np.float64) * 1e6, f"{metric}_um", metric
+    return np.asarray(vals_px, dtype=np.float64), f"{metric}_px", metric
 
 
 def _bead_diameters_um(data: dict) -> np.ndarray:
     """Backward-compatible calibrated histogram-vector helper."""
 
-    values, header = bead_histogram_values(data)
+    values, header, _metric = bead_histogram_values(data)
     return values if header.endswith("_um") else np.array([], dtype=np.float64)
 
 
@@ -170,7 +202,7 @@ def _format_stats_text(values: np.ndarray, unit: str) -> str:
     )
 
 
-def _plot_bead_histogram(values: np.ndarray, title: str, output_path: Path, header: str = "mean_xy_diameter_um") -> None:
+def _plot_bead_histogram(values: np.ndarray, title: str, output_path: Path, header: str = "equivalent_diameter_um") -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     if values.size:
         bins = min(max(8, int(np.sqrt(values.size))), 40)
@@ -181,8 +213,9 @@ def _plot_bead_histogram(values: np.ndarray, title: str, output_path: Path, head
         ax.text(0.5, 0.5, "No valid diameters", ha="center", va="center", transform=ax.transAxes)
 
     ax.set_title(title)
-    unit = "um" if header.endswith("_um") else "px"
-    ax.set_xlabel(f"Mean X/Y diameter [{unit}]")
+    unit = "µm" if header.endswith("_um") else "px"
+    metric = header.removesuffix("_um").removesuffix("_px")
+    ax.set_xlabel(bead_size_metric_label(metric, unit))
     ax.set_ylabel("Count")
     ax.grid(True, alpha=0.25)
     ax.text(
@@ -213,16 +246,18 @@ def export_bead_histograms(outputs_dir: Path = OUTPUTS_DIR, hist_dir: Path | Non
     hist_dir = hist_dir or outputs_dir / BEAD_HISTOGRAM_DIR_NAME
     hist_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    combined: dict[str, list[np.ndarray]] = {"mean_xy_diameter_um": [], "mean_xy_diameter_px": []}
+    combined: dict[str, list[np.ndarray]] = {
+        f"{metric}_{unit}": [] for metric in BEAD_SIZE_METRICS for unit in ("um", "px")
+    }
 
     for json_path in sort_paths(list(outputs_dir.glob("*.json"))):
         data = _load_json(json_path)
         if _classify_summary(data) != "bead":
             continue
-        values, header = bead_histogram_values(data)
+        values, header, metric = bead_histogram_values(data)
         combined[header].append(values)
         unit_suffix = "um" if header.endswith("_um") else "px"
-        stem = f"{_safe_name(json_path.stem)}_bead_mean_xy_diameter_{unit_suffix}"
+        stem = f"{_safe_name(json_path.stem)}_bead_{metric}_{unit_suffix}"
         out_path = hist_dir / f"{stem}_histogram.png"
         _plot_bead_histogram(values, json_path.stem, out_path, header)
         written.append(out_path)
@@ -233,7 +268,8 @@ def export_bead_histograms(outputs_dir: Path = OUTPUTS_DIR, hist_dir: Path | Non
             continue
         all_vals = np.concatenate([vals for vals in vectors if vals.size]) if any(vals.size for vals in vectors) else np.array([], dtype=np.float64)
         unit_suffix = "um" if header.endswith("_um") else "px"
-        stem = f"all_bead_mean_xy_diameter_{unit_suffix}"
+        metric = header.removesuffix("_um").removesuffix("_px")
+        stem = f"all_bead_{metric}_{unit_suffix}"
         out_path = hist_dir / f"{stem}_histogram.png"
         _plot_bead_histogram(all_vals, "All bead outputs", out_path, header)
         written.append(out_path)
