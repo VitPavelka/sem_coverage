@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +30,13 @@ from path_utils import (
 )
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
 from tabular_export import sort_paths
-from coverage_cap import CoverageCapMetrics, compute_coverage_cap_metrics
+from coverage_cap import (
+    CoverageCapMetrics,
+    compute_coverage_cap_metrics,
+    normalize_cap_coverage_metric,
+    normalize_sphere_diameter_metric,
+    sphere_diameter_px as _cap_sphere_diameter_px,
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,18 @@ class CoverageViewerConfig:
     coverage_cap_enabled: bool = True
     coverage_cap_radius_fraction: float = 0.25
     coverage_cap_min_completeness: float = 0.98
+    sphere_diameter_metric: str = "mean_xy_diameter"
+    selected_cap_coverage_metric: str = "projected_fraction"
+    coverage_cap_graph_mode: str = "cumulative"
+    coverage_homogeneity_enabled: bool = True
+    homogeneity_inner_radius_fraction: float = 0.10
+    homogeneity_outer_radius_fraction: float = 0.75
+    radial_ring_width_fraction: float = 0.05
+    polar_sector_count: int = 12
+    homogeneity_min_segment_completeness: float = 0.95
+    homogeneity_view_mode: str = "radial"
+    # Deprecated compatibility field.  All explicit cap metrics are now
+    # available; it no longer selects the primary reported cap metric.
     coverage_cap_surface_weighting_enabled: bool = False
     default_show_scale: bool = True
     default_show_bead_boundary: bool = True
@@ -165,6 +183,8 @@ class BeadCoverageResult:
     cap_projected_coverage_percent: float | None = None
     cap_surface_weighted_coverage: float | None = None
     cap_surface_weighted_coverage_percent: float | None = None
+    cap_projected_over_surface_coverage: float | None = None
+    cap_projected_over_surface_coverage_percent: float | None = None
     selected_coverage_method: str = "legacy_full_projected"
 
 
@@ -276,6 +296,13 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
     analyzer = AnalyzerConfig(**analyzer_data) if analyzer_data else AnalyzerConfig()
     viewer_data["analyzer"] = analyzer
     viewer = CoverageViewerConfig(**viewer_data)
+    viewer = replace(
+        viewer,
+        sphere_diameter_metric=normalize_sphere_diameter_metric(viewer.sphere_diameter_metric),
+        selected_cap_coverage_metric=normalize_cap_coverage_metric(
+            viewer.selected_cap_coverage_metric
+        ),
+    )
     return CoverageAppConfig(
         folder=data["folder"],
         file=data.get("file") or None,
@@ -712,7 +739,11 @@ def _segment_ag_coverage(
     return mask, feat, float(t * float(thr_rel))
 
 
-def _measure_bead(bead_mask: np.ndarray, pixel_size_m: Optional[float]) -> BeadMetrics:
+def _measure_bead(
+    bead_mask: np.ndarray,
+    pixel_size_m: Optional[float],
+    sphere_diameter_metric: str = "mean_xy_diameter",
+) -> BeadMetrics:
     region = max(regionprops(label(bead_mask.astype(np.uint8))), key=lambda r: r.area)
     rows, cols = region.coords[:, 0], region.coords[:, 1]
     x_px = float(cols.max() - cols.min() + 1)
@@ -728,7 +759,9 @@ def _measure_bead(bead_mask: np.ndarray, pixel_size_m: Optional[float]) -> BeadM
     eqd_m = _scaled(eqd_px)
     # Coverage uses the same X/Y bounding-box diameters shown by the viewer.
     # This is deliberately separate from equivalent diameter and major/minor.
-    sphere_diameter_px = float((x_px + y_px) / 2.0)
+    sphere_diameter_px = _cap_sphere_diameter_px(
+        eqd_px, x_px, y_px, sphere_diameter_metric
+    )
     sphere_radius_px = float(sphere_diameter_px / 2.0)
     sphere_diameter_m = _scaled(sphere_diameter_px)
     sphere_radius_m = _scaled(sphere_radius_px)
@@ -829,7 +862,9 @@ def _build_roi_result(
         threshold_abs=float(count_thr) * float(analyzer.config.count_thr_rel),
         exclude_border=False,
     )
-    bead_metrics = _measure_bead(bead_mask, pixel_size_m)
+    bead_metrics = _measure_bead(
+        bead_mask, pixel_size_m, config.sphere_diameter_metric
+    )
     cap_metrics = compute_coverage_cap_metrics(
         bead_mask,
         ag_mask,
@@ -837,12 +872,14 @@ def _build_roi_result(
         bead_metrics.sphere_radius_px,
         config.coverage_cap_radius_fraction,
         pixel_size_m,
-        compute_surface_weighted=config.coverage_cap_surface_weighting_enabled,
+        compute_surface_weighted=True,
         min_completeness=config.coverage_cap_min_completeness,
     )
-    if config.coverage_cap_enabled and cap_metrics.valid and cap_metrics.projected_coverage is not None:
-        coverage = float(cap_metrics.projected_coverage)
-        selected_method = "cap_projected"
+    selected_cap_metric = normalize_cap_coverage_metric(config.selected_cap_coverage_metric)
+    selected_cap_value = cap_metrics.selected_value(selected_cap_metric)
+    if config.coverage_cap_enabled and cap_metrics.valid and selected_cap_value is not None:
+        coverage = float(selected_cap_value)
+        selected_method = f"cap_{selected_cap_metric}"
     else:
         coverage = float(legacy_coverage)
         selected_method = "legacy_full_projected"
@@ -883,6 +920,12 @@ def _build_roi_result(
         cap_surface_weighted_coverage_percent=(
             float(cap_metrics.surface_weighted_coverage * 100.0)
             if cap_metrics.surface_weighted_coverage is not None
+            else None
+        ),
+        cap_projected_over_surface_coverage=cap_metrics.projected_over_cap_surface,
+        cap_projected_over_surface_coverage_percent=(
+            float(cap_metrics.projected_over_cap_surface * 100.0)
+            if cap_metrics.projected_over_cap_surface is not None
             else None
         ),
         selected_coverage_method=selected_method,
@@ -1128,6 +1171,7 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "legacy_full_projected_coverage_percent": _safe_float(roi.legacy_full_projected_coverage_percent),
                     "cap_projected_coverage_percent": _safe_float(roi.cap_projected_coverage_percent),
                     "cap_surface_weighted_coverage_percent": _safe_float(roi.cap_surface_weighted_coverage_percent),
+                    "cap_projected_over_surface_coverage_percent": _safe_float(roi.cap_projected_over_surface_coverage_percent),
                     "selected_coverage_percent": _safe_float(roi.coverage_percent),
                     "selected_coverage_method": roi.selected_coverage_method,
                     "projected_ag_count": int(roi.projected_ag_count),
@@ -1151,6 +1195,8 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "bead_solidity": _safe_float(roi.bead_metrics.solidity),
                     "coverage_cap_enabled": bool(config.coverage_cap_enabled),
                     "coverage_cap_radius_fraction": float(config.coverage_cap_radius_fraction),
+                    "sphere_diameter_metric": config.sphere_diameter_metric,
+                    "selected_cap_coverage_metric": config.selected_cap_coverage_metric,
                     "coverage_cap_projected_radius_px": _safe_float(roi.cap_metrics.geometry.cap_radius_px) if roi.cap_metrics else None,
                     "coverage_cap_projected_radius_m": _safe_float(roi.cap_metrics.cap_radius_m) if roi.cap_metrics else None,
                     "coverage_cap_half_angle_deg": _safe_float(roi.cap_metrics.geometry.half_angle_deg) if roi.cap_metrics else None,

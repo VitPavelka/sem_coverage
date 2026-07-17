@@ -8,9 +8,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
+
+
+SPHERE_DIAMETER_METRICS = ("mean_xy_diameter", "equivalent_diameter")
+CAP_COVERAGE_METRICS = (
+    "projected_fraction",
+    "surface_weighted_fraction",
+    "projected_over_cap_surface",
+)
+
+
+def normalize_sphere_diameter_metric(metric: str) -> str:
+    """Validate the scalar used solely for spherical-cap geometry."""
+
+    value = str(metric).strip().casefold()
+    if value not in SPHERE_DIAMETER_METRICS:
+        raise ValueError(
+            f"Unsupported sphere_diameter_metric {metric!r}. Supported values: "
+            "mean_xy_diameter, equivalent_diameter."
+        )
+    return value
+
+
+def normalize_cap_coverage_metric(metric: str) -> str:
+    """Validate one explicit central-cap coverage metric name."""
+
+    value = str(metric).strip().casefold()
+    if value not in CAP_COVERAGE_METRICS:
+        raise ValueError(
+            f"Unsupported selected_cap_coverage_metric {metric!r}. Supported values: "
+            "projected_fraction, surface_weighted_fraction, projected_over_cap_surface."
+        )
+    return value
+
+
+def sphere_diameter_px(
+    equivalent_diameter_px: float, x_diameter_px: float, y_diameter_px: float, metric: str
+) -> float:
+    """Return the cap-geometry sphere diameter from already measured ROI values."""
+
+    if normalize_sphere_diameter_metric(metric) == "equivalent_diameter":
+        return float(equivalent_diameter_px)
+    return float((x_diameter_px + y_diameter_px) / 2.0)
 
 
 @dataclass(frozen=True)
@@ -36,6 +78,13 @@ class CoverageCapMetrics:
     geometry: CoverageCapGeometry
     valid: bool
     invalid_reason: str | None
+    projected_fraction: float | None
+    surface_weighted_fraction: float | None
+    projected_over_cap_surface: float | None
+    bead_pixel_count: int
+    ag_pixel_count: int
+    theoretical_circle_pixel_count: int
+    # Backward-compatible aliases retained for existing JSON/viewer callers.
     projected_coverage: float | None
     surface_weighted_coverage: float | None
     projected_area_px2: float
@@ -44,6 +93,11 @@ class CoverageCapMetrics:
     surface_area_m2: float | None
     cap_radius_m: float | None
     height_m: float | None
+
+    def selected_value(self, metric: str) -> float | None:
+        """Return one explicitly selected cap metric without changing geometry."""
+
+        return getattr(self, normalize_cap_coverage_metric(metric))
 
 
 def nearest_mask_pixel(mask: np.ndarray, center_rc: tuple[float, float]) -> tuple[int, int]:
@@ -69,7 +123,7 @@ def compute_coverage_cap_metrics(
     radius_fraction: float,
     pixel_size_m: Optional[float],
     *,
-    compute_surface_weighted: bool,
+    compute_surface_weighted: bool = True,
     min_completeness: float,
 ) -> CoverageCapMetrics:
     """Compute central-cap metrics from existing full-size segmentation masks.
@@ -109,10 +163,14 @@ def compute_coverage_cap_metrics(
 
     projected: float | None = None
     weighted: float | None = None
+    projected_over_surface: float | None = None
+    bead_count = int(valid_mask.sum())
+    ag_count = int((ag & valid_mask).sum())
     if valid:
-        denominator = int(valid_mask.sum())
-        projected = float((ag & valid_mask).sum() / denominator) if denominator else None
-        if compute_surface_weighted and denominator:
+        projected = float(ag_count / bead_count) if bead_count else None
+        # This inexpensive post-processing value is always calculated.  The
+        # argument remains for compatibility with older callers/configs.
+        if bead_count:
             # The cap fraction can equal one, so keep the denominator finite at
             # the limiting circle edge without changing ordinary interior values.
             radial_sq = distance_sq.astype(np.float64)
@@ -120,6 +178,7 @@ def compute_coverage_cap_metrics(
             weights = sphere_radius_px / denom
             valid_weights = weights[valid_mask]
             weighted = float(weights[ag & valid_mask].sum() / valid_weights.sum())
+        projected_over_surface = float(ag_count / surface_area_px2) if surface_area_px2 > 0 else None
 
     scale2 = pixel_size_m * pixel_size_m if pixel_size_m and pixel_size_m > 0 else None
     return CoverageCapMetrics(
@@ -137,6 +196,12 @@ def compute_coverage_cap_metrics(
         ),
         valid=valid,
         invalid_reason=invalid_reason,
+        projected_fraction=projected,
+        surface_weighted_fraction=weighted,
+        projected_over_cap_surface=projected_over_surface,
+        bead_pixel_count=bead_count,
+        ag_pixel_count=ag_count,
+        theoretical_circle_pixel_count=theoretical_count,
         projected_coverage=projected,
         surface_weighted_coverage=weighted,
         projected_area_px2=projected_area_px2,
@@ -146,3 +211,74 @@ def compute_coverage_cap_metrics(
         cap_radius_m=float(cap_radius_px * pixel_size_m) if pixel_size_m else None,
         height_m=float(height_px * pixel_size_m) if pixel_size_m else None,
     )
+
+
+def cumulative_cap_sweep(
+    bead_mask: np.ndarray,
+    ag_mask: np.ndarray,
+    center_rc: tuple[float, float],
+    sphere_radius_px: float,
+    fractions: Sequence[float],
+    pixel_size_m: Optional[float],
+    *,
+    min_completeness: float,
+) -> list[CoverageCapMetrics]:
+    """Evaluate many cap fractions from existing masks without segmentation."""
+
+    return [
+        compute_coverage_cap_metrics(
+            bead_mask, ag_mask, center_rc, sphere_radius_px, float(fraction), pixel_size_m,
+            compute_surface_weighted=True, min_completeness=min_completeness,
+        )
+        for fraction in fractions
+    ]
+
+
+def annular_cap_profile(
+    bead_mask: np.ndarray,
+    ag_mask: np.ndarray,
+    center_rc: tuple[float, float],
+    sphere_radius_px: float,
+    *,
+    bins: int = 16,
+) -> list[dict[str, float | int | None]]:
+    """Compute non-overlapping local radial cap metrics from existing masks."""
+
+    bead = np.asarray(bead_mask, dtype=bool)
+    ag = np.asarray(ag_mask, dtype=bool)
+    if bead.ndim != 2 or ag.shape != bead.shape or not bead.any() or sphere_radius_px <= 0:
+        raise ValueError("Matching non-empty masks and a positive sphere radius are required.")
+    if bins < 1:
+        raise ValueError("Profile bins must be positive.")
+    anchor_row, anchor_col = nearest_mask_pixel(bead, center_rc)
+    rows, cols = np.ogrid[: bead.shape[0], : bead.shape[1]]
+    radial_sq = (rows - anchor_row) ** 2 + (cols - anchor_col) ** 2
+    normalized = np.sqrt(radial_sq) / sphere_radius_px
+    weights = sphere_radius_px / np.sqrt(np.maximum(sphere_radius_px**2 - radial_sq, 1e-12))
+    output: list[dict[str, float | int | None]] = []
+    for index in range(bins):
+        low, high = index / bins, (index + 1) / bins
+        annulus = (normalized >= low) & ((normalized < high) if index < bins - 1 else (normalized <= high))
+        bead_region = annulus & bead
+        ag_region = bead_region & ag
+        bead_count = int(bead_region.sum())
+        ag_count = int(ag_region.sum())
+        # The spherical-zone area for theta_low..theta_high is
+        # 2*pi*R^2*(cos(theta_low)-cos(theta_high)).
+        surface_area = float(2.0 * math.pi * sphere_radius_px**2 * (
+            math.sqrt(max(0.0, 1.0 - low**2)) - math.sqrt(max(0.0, 1.0 - high**2))
+        ))
+        output.append({
+            "r_over_R_inner": low,
+            "r_over_R_outer": high,
+            "r_over_R_center": (low + high) / 2.0,
+            "bead_pixel_count": bead_count,
+            "ag_pixel_count": ag_count,
+            "projected_fraction": float(ag_count / bead_count) if bead_count else None,
+            "surface_weighted_fraction": (
+                float(weights[ag_region].sum() / weights[bead_region].sum())
+                if bead_count and float(weights[bead_region].sum()) > 0 else None
+            ),
+            "projected_over_cap_surface": float(ag_count / surface_area) if surface_area > 0 else None,
+        })
+    return output

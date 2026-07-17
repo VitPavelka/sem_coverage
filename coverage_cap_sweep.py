@@ -15,7 +15,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from coverage_cap import compute_coverage_cap_metrics
+from coverage_cap import annular_cap_profile, compute_coverage_cap_metrics
 from sem_coverage_viewer import (
     CoverageSegmentationFailure,
     CoverageViewerConfig,
@@ -30,11 +30,13 @@ SWEEP_COLUMNS = (
     "source_file", "roi_index", "cap_radius_fraction", "cap_half_angle_deg",
     "cap_radius_px", "cap_radius_um", "cap_completeness", "cap_valid",
     "legacy_full_projected_coverage_percent", "cap_projected_coverage_percent",
-    "cap_surface_weighted_coverage_percent", "cap_projected_area_um2", "cap_surface_area_um2",
+    "cap_surface_weighted_coverage_percent", "cap_projected_over_cap_surface_percent",
+    "cap_projected_area_um2", "cap_surface_area_um2",
 )
 PROFILE_COLUMNS = (
     "r_over_R_inner", "r_over_R_outer", "r_over_R_center", "bead_pixel_count",
-    "ag_pixel_count", "projected_coverage_percent",
+    "ag_pixel_count", "projected_fraction_percent", "surface_weighted_fraction_percent",
+    "projected_over_cap_surface_percent",
 )
 
 
@@ -69,25 +71,18 @@ def _write_rows(path: Path, columns: Sequence[str], rows: Sequence[dict]) -> Pat
 
 
 def radial_coverage_profile(bead_mask: np.ndarray, ag_mask: np.ndarray, center_rc: tuple[float, float], radius_px: float, bins: int = 10) -> list[dict]:
-    """Compute non-overlapping projected-coverage annuli from existing masks."""
+    """Backward-compatible wrapper around the shared annular profile helper."""
 
-    if bins < 1 or radius_px <= 0:
-        raise ValueError("Profile bins and radius must be positive.")
-    rows, cols = np.ogrid[:bead_mask.shape[0], :bead_mask.shape[1]]
-    normalized = np.sqrt((rows - center_rc[0]) ** 2 + (cols - center_rc[1]) ** 2) / radius_px
-    output: list[dict] = []
-    for index in range(bins):
-        low, high = index / bins, (index + 1) / bins
-        annulus = (normalized >= low) & ((normalized < high) if index < bins - 1 else (normalized <= high))
-        bead_count = int((annulus & bead_mask).sum())
-        ag_count = int((annulus & bead_mask & ag_mask).sum())
-        output.append({
-            "r_over_R_inner": low, "r_over_R_outer": high,
-            "r_over_R_center": (low + high) / 2.0,
-            "bead_pixel_count": bead_count, "ag_pixel_count": ag_count,
-            "projected_coverage_percent": (100.0 * ag_count / bead_count) if bead_count else None,
-        })
-    return output
+    rows = annular_cap_profile(bead_mask, ag_mask, center_rc, radius_px, bins=bins)
+    for row in rows:
+        row["projected_fraction_percent"] = _percent(row.pop("projected_fraction"))
+        row["surface_weighted_fraction_percent"] = _percent(row.pop("surface_weighted_fraction"))
+        row["projected_over_cap_surface_percent"] = _percent(row.pop("projected_over_cap_surface"))
+    return rows
+
+
+def _percent(value: float | None) -> float | None:
+    return None if value is None else float(value * 100.0)
 
 
 def evaluate_roi_sweep(roi, source_file: Path, pixel_size_m: float | None, fractions: Sequence[float], *, include_surface_weighted: bool) -> list[dict]:
@@ -98,7 +93,7 @@ def evaluate_roi_sweep(roi, source_file: Path, pixel_size_m: float | None, fract
         cap = compute_coverage_cap_metrics(
             roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc,
             roi.bead_metrics.sphere_radius_px, fraction, pixel_size_m,
-            compute_surface_weighted=include_surface_weighted, min_completeness=0.0,
+            compute_surface_weighted=True, min_completeness=0.0,
         )
         rows.append({
             "source_file": source_file.name, "roi_index": roi.roi_index,
@@ -109,6 +104,7 @@ def evaluate_roi_sweep(roi, source_file: Path, pixel_size_m: float | None, fract
             "legacy_full_projected_coverage_percent": roi.legacy_full_projected_coverage_percent,
             "cap_projected_coverage_percent": cap.projected_coverage * 100.0 if cap.projected_coverage is not None else None,
             "cap_surface_weighted_coverage_percent": cap.surface_weighted_coverage * 100.0 if cap.surface_weighted_coverage is not None else None,
+            "cap_projected_over_cap_surface_percent": cap.projected_over_cap_surface * 100.0 if cap.projected_over_cap_surface is not None else None,
             "cap_projected_area_um2": cap.projected_area_m2 * 1e12 if cap.projected_area_m2 is not None else None,
             "cap_surface_area_um2": cap.surface_area_m2 * 1e12 if cap.surface_area_m2 is not None else None,
         })
@@ -123,6 +119,9 @@ def _plot_sweep(rows: Sequence[dict], output_path: Path, title: str) -> Path:
     weighted = [row["cap_surface_weighted_coverage_percent"] for row in rows]
     if any(value is not None for value in weighted):
         ax.plot(fractions, weighted, "s--", label="experimental surface weighted")
+    over_surface = [row["cap_projected_over_cap_surface_percent"] for row in rows]
+    if any(value is not None for value in over_surface):
+        ax.plot(fractions, over_surface, "^:", label="Ag projected / cap surface")
     ax.axhline(rows[0]["legacy_full_projected_coverage_percent"], color="0.35", linestyle=":", label="legacy full projected")
     invalid = [row for row in rows if not row["cap_valid"]]
     if invalid:
@@ -134,9 +133,12 @@ def _plot_sweep(rows: Sequence[dict], output_path: Path, title: str) -> Path:
 
 def _plot_profile(rows: Sequence[dict], output_path: Path, title: str) -> Path:
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot([row["r_over_R_center"] for row in rows], [row["projected_coverage_percent"] for row in rows], "o-")
+    x = [row["r_over_R_center"] for row in rows]
+    ax.plot(x, [row["projected_fraction_percent"] for row in rows], "o-", label="projected")
+    ax.plot(x, [row["surface_weighted_fraction_percent"] for row in rows], "s--", label="surface weighted")
+    ax.plot(x, [row["projected_over_cap_surface_percent"] for row in rows], "^:", label="Ag / zone surface")
     ax.set(xlabel="Normalized radius r/R", ylabel="Local projected coverage [%]", title=title)
-    ax.grid(alpha=0.25); fig.tight_layout(); fig.savefig(output_path, dpi=180); plt.close(fig)
+    ax.grid(alpha=0.25); ax.legend(); fig.tight_layout(); fig.savefig(output_path, dpi=180); plt.close(fig)
     return output_path
 
 

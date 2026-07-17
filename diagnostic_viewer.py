@@ -72,7 +72,15 @@ from sem_coverage_viewer import (
     load_app_config as load_coverage_app_config,
     load_failed_image_preview,
 )
-from coverage_cap import compute_coverage_cap_metrics
+from coverage_cap import (
+    annular_cap_profile,
+    compute_coverage_cap_metrics,
+    cumulative_cap_sweep,
+    normalize_cap_coverage_metric,
+    normalize_sphere_diameter_metric,
+    sphere_diameter_px as _cap_sphere_diameter_px,
+)
+from coverage_homogeneity import compute_homogeneity
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer
 
 LOGGER = logging.getLogger(__name__)
@@ -1136,9 +1144,13 @@ class CoverageDiagnosticAdapter:
     AG_COVERAGE_COLOR = (1.0, 0.0, 1.0, 1.0)
     AG_COUNT_COLOR = (1.0, 1.0, 0.0, 1.0)
     AG_PEAK_COLOR = "cyan"
-    CAP_COLOR = (0.3, 0.8, 1.0, 1.0)
+    CAP_COLOR = (1.0, 0.05, 0.05, 1.0)
     DIAMETER_X_COLOR = "cyan"
     DIAMETER_Y_COLOR = "orange"
+
+    def __init__(self) -> None:
+        self._cap_graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._homogeneity_cache: dict[tuple[Any, ...], Any] = {}
 
     @staticmethod
     def _effective_config(
@@ -1760,11 +1772,45 @@ class CoverageDiagnosticAdapter:
                 requires_analysis=False,
             ),
             _spec(
-                "coverage_cap_surface_weighting_enabled", "Experimental surface weighting", "Coverage cap", "bool",
+                "sphere_diameter_metric", "Sphere diameter metric", "Coverage cap", "choice",
                 None, None, None,
-                "EXPERIMENTAL: also reports curvature-weighted cap coverage. It never replaces the selected projected coverage.",
+                "Selects the diameter used only for cap and sphere geometry. Mean X/Y is (d_x + d_y)/2; equivalent diameter is 2*sqrt(A/pi).",
                 requires_analysis=False,
+                choices=(
+                    ("mean_xy_diameter", "Mean X/Y diameter"),
+                    ("equivalent_diameter", "Equivalent diameter"),
+                ),
             ),
+            _spec(
+                "selected_cap_coverage_metric", "Selected cap coverage metric", "Coverage cap", "choice",
+                None, None, None,
+                "Selects the cap value reported as the main diagnostic metric. The graph always shows all three cap curves.",
+                requires_analysis=False,
+                choices=(
+                    ("projected_fraction", "Projected fraction"),
+                    ("surface_weighted_fraction", "Surface-weighted fraction"),
+                    ("projected_over_cap_surface", "Projected Ag / cap surface"),
+                ),
+            ),
+            _spec(
+                "coverage_cap_graph_mode", "Cap graph mode", "Coverage cap", "choice",
+                None, None, None,
+                "Cumulative shows central caps; annular shows non-overlapping local radial rings.",
+                requires_analysis=False,
+                choices=(
+                    ("cumulative", "Cumulative"),
+                    ("annular", "Annular"),
+                ),
+            ),
+        ),
+        "Coverage homogeneity": (
+            _spec("coverage_homogeneity_enabled", "Enable coverage homogeneity", "Coverage homogeneity", "bool", None, None, None, "Enables lightweight ring and sector homogeneity analysis.", requires_analysis=False),
+            _spec("homogeneity_inner_radius_fraction", "Inner radius fraction", "Coverage homogeneity", "float", 0.0, 0.95, 0.01, "Inner analyzed radius in units of R.", requires_analysis=False),
+            _spec("homogeneity_outer_radius_fraction", "Outer radius fraction", "Coverage homogeneity", "float", 0.05, 1.0, 0.01, "Outer analyzed radius in units of R.", requires_analysis=False),
+            _spec("radial_ring_width_fraction", "Radial ring width", "Coverage homogeneity", "float", 0.01, 0.5, 0.01, "Constant non-overlapping ring width in units of R.", requires_analysis=False),
+            _spec("polar_sector_count", "Polar sector count", "Coverage homogeneity", "int", 2, 36, 1, "Equal angular sectors over the configured annulus.", requires_analysis=False),
+            _spec("homogeneity_min_segment_completeness", "Minimum segment completeness", "Coverage homogeneity", "float", 0.0, 1.0, 0.01, "Minimum retained reference fraction for a valid ring or sector.", requires_analysis=False),
+            _spec("homogeneity_view_mode", "Homogeneity view", "Coverage homogeneity", "choice", None, None, None, "Select radial rings or polar annular sectors.", requires_analysis=False, choices=(("radial", "Radial"), ("polar", "Polar"))),
         ),
     }
 
@@ -1852,6 +1898,8 @@ class CoverageDiagnosticAdapter:
                 elif spec.kind == "text":
                     parsed = spec.text_parser(value) if spec.text_parser else value
                     config = _replace_by_path(config, paths[0], parsed)
+                elif spec.kind == "choice":
+                    config = _replace_by_path(config, paths[0], str(value))
                 else:
                     config = _replace_by_path(config, paths[0], float(value))
         return config
@@ -1941,6 +1989,23 @@ class CoverageDiagnosticAdapter:
             return "Coverage cap radius fraction must satisfy 0 < f <= 1."
         if not 0.0 <= config.coverage_cap_min_completeness <= 1.0:
             return "Coverage cap minimum completeness must be between 0 and 1."
+        try:
+            normalize_sphere_diameter_metric(config.sphere_diameter_metric)
+            normalize_cap_coverage_metric(config.selected_cap_coverage_metric)
+        except ValueError as exc:
+            return str(exc)
+        if config.coverage_cap_graph_mode not in {"cumulative", "annular"}:
+            return "Coverage cap graph mode must be cumulative or annular."
+        if not (0.0 <= config.homogeneity_inner_radius_fraction < config.homogeneity_outer_radius_fraction <= 1.0):
+            return "Homogeneity radii must satisfy 0 <= inner < outer <= 1."
+        if not (0.0 < config.radial_ring_width_fraction <= config.homogeneity_outer_radius_fraction - config.homogeneity_inner_radius_fraction):
+            return "Radial ring width must be positive and no larger than the analyzed range."
+        if config.polar_sector_count < 2:
+            return "Polar sector count must be at least 2."
+        if not 0.0 <= config.homogeneity_min_segment_completeness <= 1.0:
+            return "Homogeneity segment completeness must be between 0 and 1."
+        if config.homogeneity_view_mode not in {"radial", "polar"}:
+            return "Homogeneity view mode must be radial or polar."
         if image_path is not None:
             hdr_path = _paired_hdr_path(Path(image_path))
             if hdr_path is not None:
@@ -2011,13 +2076,101 @@ class CoverageDiagnosticAdapter:
     def _cap_for_roi(roi: BeadCoverageResult, config: CoverageViewerConfig, pixel_size_m: float | None):
         """Recompute only cap post-processing from the already accepted masks."""
 
+        radius = _cap_sphere_diameter_px(
+            roi.bead_metrics.equivalent_diameter_px,
+            roi.bead_metrics.x_diameter_px,
+            roi.bead_metrics.y_diameter_px,
+            config.sphere_diameter_metric,
+        ) / 2.0
         return compute_coverage_cap_metrics(
             roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc,
-            roi.bead_metrics.sphere_radius_px, config.coverage_cap_radius_fraction,
+            radius, config.coverage_cap_radius_fraction,
             pixel_size_m,
-            compute_surface_weighted=config.coverage_cap_surface_weighting_enabled,
+            compute_surface_weighted=True,
             min_completeness=config.coverage_cap_min_completeness,
         )
+
+    def cap_graph_data(
+        self,
+        result: CoverageImageResult,
+        roi_selection: int | None,
+        config: CoverageViewerConfig,
+    ) -> dict[str, Any] | None:
+        """Return cached cumulative or annular cap curves from existing ROI masks."""
+
+        selected = self._selected_rois(result, roi_selection)
+        if roi_selection is None:
+            selected = [roi for roi in selected if _include_roi_in_global_summary(roi, config)]
+        if not selected:
+            return None
+        key = (
+            id(result), roi_selection, config.sphere_diameter_metric,
+            config.coverage_cap_min_completeness,
+        )
+        cached = self._cap_graph_cache.get(key)
+        if cached is not None:
+            return cached
+        fractions = np.linspace(0.05, 0.95, 19)
+        cumulative: list[list[Any]] = []
+        annular: list[list[dict[str, Any]]] = []
+        legacy: list[float] = []
+        for roi in selected:
+            radius = _cap_sphere_diameter_px(
+                roi.bead_metrics.equivalent_diameter_px, roi.bead_metrics.x_diameter_px,
+                roi.bead_metrics.y_diameter_px, config.sphere_diameter_metric,
+            ) / 2.0
+            cumulative.append(cumulative_cap_sweep(
+                roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc, radius,
+                fractions, result.metadata.mean_pixel_size_m,
+                min_completeness=config.coverage_cap_min_completeness,
+            ))
+            annular.append(annular_cap_profile(
+                roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc, radius, bins=16
+            ))
+            legacy.append(float(roi.legacy_full_projected_coverage))
+        metric_names = (
+            "projected_fraction", "surface_weighted_fraction", "projected_over_cap_surface"
+        )
+        cumulative_values = {
+            name: np.asarray([
+                [np.nan if cap.selected_value(name) is None else cap.selected_value(name) for cap in row]
+                for row in cumulative
+            ], dtype=float)
+            for name in metric_names
+        }
+        annular_values = {
+            name: np.asarray([
+                [np.nan if item[name] is None else item[name] for item in row]
+                for row in annular
+            ], dtype=float)
+            for name in metric_names
+        }
+        cached = {
+            "fractions": fractions,
+            "annular_x": np.asarray([item["r_over_R_center"] for item in annular[0]], dtype=float),
+            "cumulative": cumulative_values,
+            "annular": annular_values,
+            "invalid": np.asarray([[not cap.valid for cap in row] for row in cumulative], dtype=bool),
+            "legacy": float(np.mean(legacy)),
+        }
+        self._cap_graph_cache[key] = cached
+        return cached
+
+    def homogeneity_data(self, result: CoverageImageResult, roi_selection: int | None, config: CoverageViewerConfig):
+        """Return cached direct ring/sector analysis from existing masks."""
+        rois = self._selected_rois(result, roi_selection)
+        if roi_selection is None:
+            rois = [roi for roi in rois if _include_roi_in_global_summary(roi, config)]
+        output=[]
+        for roi in rois:
+            radius=_cap_sphere_diameter_px(roi.bead_metrics.equivalent_diameter_px, roi.bead_metrics.x_diameter_px, roi.bead_metrics.y_diameter_px, config.sphere_diameter_metric)/2
+            key=(id(roi), config.sphere_diameter_metric, config.homogeneity_inner_radius_fraction, config.homogeneity_outer_radius_fraction, config.radial_ring_width_fraction, config.polar_sector_count, config.homogeneity_min_segment_completeness, config.selected_cap_coverage_metric)
+            item=self._homogeneity_cache.get(key)
+            if item is None:
+                item=compute_homogeneity(roi.bead_mask,roi.ag_mask,roi.bead_metrics.centroid_rc,radius,inner=config.homogeneity_inner_radius_fraction,outer=config.homogeneity_outer_radius_fraction,width=config.radial_ring_width_fraction,sectors=config.polar_sector_count,min_completeness=config.homogeneity_min_segment_completeness,metric=config.selected_cap_coverage_metric)
+                self._homogeneity_cache[key]=item
+            output.append(item)
+        return output
 
     def render_stage(
         self,
@@ -2121,9 +2274,12 @@ class CoverageDiagnosticAdapter:
             text_overlays.append(
                 TextOverlay(
                     control_label="Cap completeness status",
-                    row=cap.geometry.center_rc[0] + 12.0,
+                    row=cap.geometry.center_rc[0],
                     col=cap.geometry.center_rc[1],
-                    text=(f"cap {cap.geometry.completeness:.3f}" if cap.valid else f"cap invalid: {cap.invalid_reason}"),
+                    text=(
+                        f"a/R = {cap.geometry.radius_fraction:.2f}"
+                        if cap.valid else f"cap invalid: {cap.geometry.completeness:.3f}"
+                    ),
                     color="white" if cap.valid else "red", fontsize=7.0, boxed=True,
                 )
             )
@@ -2178,12 +2334,12 @@ class CoverageDiagnosticAdapter:
                     x_label_row=(
                         None
                         if x_chord is None
-                        else x_chord.start_row - 5.0
+                        else (x_chord.start_row + x_chord.end_row) / 2.0
                     ),
                     x_label_col=(
                         None
                         if x_chord is None
-                        else (x_chord.start_col + x_chord.end_col) / 2.0
+                        else x_chord.start_col - 10.0
                     ),
                     x_label_color=self.DIAMETER_X_COLOR,
                     y_label_text=(
@@ -2196,12 +2352,12 @@ class CoverageDiagnosticAdapter:
                     y_label_row=(
                         None
                         if y_chord is None
-                        else (y_chord.start_row + y_chord.end_row) / 2.0
+                        else y_chord.start_row - 10.0
                     ),
                     y_label_col=(
                         None
                         if y_chord is None
-                        else y_chord.start_col + 5.0
+                        else (y_chord.start_col + y_chord.end_col) / 2.0
                     ),
                     y_label_color=self.DIAMETER_Y_COLOR,
                 )
@@ -2284,18 +2440,32 @@ class CoverageDiagnosticAdapter:
                 else "n/a"
             )
             cap = self._cap_for_roi(roi, config, result.metadata.mean_pixel_size_m)
+            selected_metric = normalize_cap_coverage_metric(config.selected_cap_coverage_metric)
+            selected_value = cap.selected_value(selected_metric)
             cap_text = (
-                f"cap {cap.projected_coverage * 100.0:.2f}%"
-                if cap.projected_coverage is not None else f"cap invalid ({cap.geometry.completeness:.3f})"
+                f"{selected_metric} {selected_value * 100.0:.2f}%"
+                if selected_value is not None else f"cap invalid ({cap.geometry.completeness:.3f})"
             )
-            weighted_text = (
-                f" | experimental weighted {cap.surface_weighted_coverage * 100.0:.2f}%"
-                if cap.surface_weighted_coverage is not None else ""
+            cap_values = (
+                f"projected {cap.projected_fraction * 100.0:.2f}% | "
+                f"weighted {cap.surface_weighted_fraction * 100.0:.2f}% | "
+                f"Ag/cap surface {cap.projected_over_cap_surface * 100.0:.2f}%"
+                if cap.projected_fraction is not None
+                and cap.surface_weighted_fraction is not None
+                and cap.projected_over_cap_surface is not None else "cap invalid"
+            )
+            sphere_diameter = _cap_sphere_diameter_px(
+                metrics.equivalent_diameter_px, metrics.x_diameter_px,
+                metrics.y_diameter_px, config.sphere_diameter_metric,
             )
             return (
                 f"ROI {roi.roi_index} | {self._coverage_status(roi, config)} | "
                 f"selected {cap_text if config.coverage_cap_enabled else f'legacy {roi.legacy_full_projected_coverage_percent:.2f}%'} | "
-                f"legacy {roi.legacy_full_projected_coverage_percent:.2f}% | {cap_text}{weighted_text} | projected {roi.projected_ag_count} | "
+                f"legacy {roi.legacy_full_projected_coverage_percent:.2f}% | {cap_values} | "
+                f"sphere ({config.sphere_diameter_metric}) {sphere_diameter:.1f} px | "
+                f"cap a/R {cap.geometry.radius_fraction:.2f}, a {cap.geometry.cap_radius_px:.1f} px, "
+                f"angle {cap.geometry.half_angle_deg:.1f} deg, completeness {cap.geometry.completeness:.3f}, "
+                f"bead/Ag cap px {cap.bead_pixel_count}/{cap.ag_pixel_count} | projected {roi.projected_ag_count} | "
                 f"sphere {roi.sphere_ag_count_est:.1f} | density {density} | "
                 f"eq {eq_text} | anisotropy {metrics.anisotropy_ratio:.3f} | "
                 f"solidity {metrics.solidity:.3f} | count thr {roi.ag_count_threshold:.4f} | "
@@ -2308,8 +2478,9 @@ class CoverageDiagnosticAdapter:
         coverage_values = []
         for roi in included:
             cap = self._cap_for_roi(roi, config, result.metadata.mean_pixel_size_m)
-            if config.coverage_cap_enabled and cap.projected_coverage is not None:
-                coverage_values.append(cap.projected_coverage * 100.0)
+            selected = cap.selected_value(config.selected_cap_coverage_metric)
+            if config.coverage_cap_enabled and selected is not None:
+                coverage_values.append(selected * 100.0)
             else:
                 coverage_values.append(roi.legacy_full_projected_coverage_percent)
         densities = [
@@ -2342,6 +2513,7 @@ class CoverageDiagnosticAdapter:
             "Cap boundary",
             "Cap center",
             "Cap completeness status",
+            "Homogeneity boundaries",
             "Rejected candidate boundaries",
             "Raw candidate boundaries",
             "Rejected candidate labels",
@@ -2361,6 +2533,7 @@ class CoverageDiagnosticAdapter:
             "Cap boundary": True,
             "Cap center": True,
             "Cap completeness status": True,
+            "Homogeneity boundaries": True,
             "Rejected candidate boundaries": True,
             "Raw candidate boundaries": False,
             "Rejected candidate labels": True,
@@ -2872,6 +3045,7 @@ class DiagnosticViewer:
         self._overlay_checks_callback_id: int | None = None
         self._canvas_callback_ids: list[int] = []
         self._control_slot_axes: list[Axes] = []
+        self.cap_graph_axis: Axes | None = None
         self.dimension_lines: list[tuple[Line2D, Line2D]] = []
         self.measurement_labels: list[Text] = []
         self._measurement_label_groups: list[tuple[Text, Text, Text]] = []
@@ -2972,6 +3146,8 @@ class DiagnosticViewer:
         )
 
         self._build_control_slots()
+        self.cap_graph_axis = self.fig.add_axes([0.705, 0.145, 0.275, 0.155])
+        self.cap_graph_axis.set_visible(False)
         self._rebuild_parameter_controls()
         self._build_buttons()
 
@@ -3051,12 +3227,13 @@ class DiagnosticViewer:
         self, axis: Axes, spec: ParameterSpec, value: Any
     ) -> Slider | RangeSlider | CheckButtons | TextBox | RadioButtons:
         if spec.kind == "range":
-            current_low, current_high = value
-            minimum = min(float(spec.minimum), float(current_low))
-            maximum = max(float(spec.maximum), float(current_high))
+            minimum = float(spec.minimum)
+            maximum = float(spec.maximum)
+            value = tuple(np.clip(value, minimum, maximum))
         elif spec.kind in ("float", "int"):
-            minimum = min(float(spec.minimum), float(value))
-            maximum = max(float(spec.maximum), float(value))
+            minimum = float(spec.minimum)
+            maximum = float(spec.maximum)
+            value = float(np.clip(float(value), minimum, maximum))
         else:
             minimum = maximum = 0.0
 
@@ -3164,6 +3341,7 @@ class DiagnosticViewer:
         self.current_group = label
         self._help_message = ""
         self._rebuild_parameter_controls()
+        self._update_cap_graph()
         self._update_status()
 
     @property
@@ -3330,6 +3508,11 @@ class DiagnosticViewer:
         self.current_viewer_config = candidate
         self._clear_validation_error()
         self._update_control_activity_states()
+        if name in {
+            "coverage_cap_radius_fraction", "coverage_cap_min_completeness",
+            "sphere_diameter_metric", "selected_cap_coverage_metric", "coverage_cap_graph_mode",
+        }:
+            self._update_cap_graph()
         if spec.kind in {"float", "int", "range"}:
             self._slider_change_pending = True
             self._message = "Pending changes. Release the mouse or use Apply changes."
@@ -3458,6 +3641,20 @@ class DiagnosticViewer:
             )
         else:
             return
+        if self.current_group == "Coverage homogeneity" and self.current_result is not None:
+            provider = getattr(self.adapter, "homogeneity_data", None)
+            if callable(provider):
+                items = provider(self.current_result, self._roi_selection, self.current_viewer_config)
+                layers = list(overlay.boundary_layers)
+                for item in items:
+                    segments = item.rings if self.current_viewer_config.homogeneity_view_mode == "radial" else item.sectors
+                    for segment in segments:
+                        if self.current_viewer_config.homogeneity_view_mode == "radial":
+                            mask=(item.r_over_R >= segment.inner)&(item.r_over_R <= segment.outer)
+                        else:
+                            mask=(item.r_over_R >= self.current_viewer_config.homogeneity_inner_radius_fraction)&(item.r_over_R <= self.current_viewer_config.homogeneity_outer_radius_fraction)&(item.phi_rad>=segment.inner)&(item.phi_rad<=segment.outer)
+                        layers.append(BoundaryLayer("Homogeneity boundaries", find_boundaries(mask, mode="outer"), (0.1,0.9,1.0,0.85) if segment.valid else (0.5,0.5,0.5,0.7)))
+                overlay = replace(overlay, boundary_layers=tuple(layers))
         image_shape = pixels.shape[:2]
         reset_view = (
             self._reset_view_on_next_result
@@ -3476,8 +3673,75 @@ class DiagnosticViewer:
             self.current_preview,
         )
         self._render_overlays()
+        self._update_cap_graph()
         self._update_status()
         self.fig.canvas.draw_idle()
+
+    def _update_cap_graph(self) -> None:
+        """Render coverage-cap curves without submitting a production analysis."""
+
+        axis = self.cap_graph_axis
+        if axis is None:
+            return
+        if self.current_group == "Coverage homogeneity" and self.current_result is not None:
+            axis.set_visible(True); axis.clear()
+            provider = getattr(self.adapter, "homogeneity_data", None)
+            items = provider(self.current_result, self._roi_selection, self.current_viewer_config) if callable(provider) else []
+            if not items:
+                axis.text(.5,.5,"No included ROI",transform=axis.transAxes,ha="center",va="center"); return
+            mode=getattr(self.current_viewer_config,"homogeneity_view_mode","radial")
+            profiles=[item.rings if mode=="radial" else item.sectors for item in items]
+            x=np.asarray([segment.center for segment in profiles[0]],float)
+            if mode=="polar": x=np.degrees(x)
+            metric=self.current_viewer_config.selected_cap_coverage_metric
+            values=np.asarray([[np.nan if getattr(segment,metric) is None else getattr(segment,metric)*100 for segment in profile] for profile in profiles])
+            mean=np.nanmean(values,axis=0); axis.plot(x,mean,"o-" if mode=="radial" else "o-",color="tab:blue")
+            if values.shape[0]>1: axis.fill_between(x,mean-np.nanstd(values,axis=0),mean+np.nanstd(values,axis=0),alpha=.18)
+            invalid=np.all(np.isnan(values),axis=0)
+            if invalid.any(): axis.scatter(x[invalid],np.zeros(invalid.sum()),marker="x",color="red")
+            axis.set(title="Radial homogeneity" if mode=="radial" else "Polar homogeneity",xlabel="Normalized radius, r/R" if mode=="radial" else "Azimuth [deg]",ylabel="Coverage metric [%]"); axis.grid(alpha=.25); axis.tick_params(labelsize=6)
+            return
+        provider = getattr(self.adapter, "cap_graph_data", None)
+        visible = (
+            self.current_group == "Coverage cap"
+            and self.current_result is not None
+            and callable(provider)
+        )
+        axis.set_visible(visible)
+        if not visible:
+            return
+        axis.clear()
+        data = provider(self.current_result, self._roi_selection, self.current_viewer_config)
+        if data is None:
+            axis.text(0.5, 0.5, "No included ROI", transform=axis.transAxes, ha="center", va="center", fontsize=8)
+            return
+        mode = getattr(self.current_viewer_config, "coverage_cap_graph_mode", "cumulative")
+        x = data["fractions"] if mode == "cumulative" else data["annular_x"]
+        series = data["cumulative"] if mode == "cumulative" else data["annular"]
+        labels = {
+            "projected_fraction": "Projected fraction",
+            "surface_weighted_fraction": "Surface weighted",
+            "projected_over_cap_surface": "Ag / cap surface",
+        }
+        colors = {"projected_fraction": "tab:blue", "surface_weighted_fraction": "tab:green", "projected_over_cap_surface": "tab:purple"}
+        for name, values in series.items():
+            mean = np.nanmean(values, axis=0)
+            axis.plot(x, mean * 100.0, label=labels[name], color=colors[name], linewidth=1.3)
+            if values.shape[0] > 1:
+                std = np.nanstd(values, axis=0)
+                axis.fill_between(x, (mean - std) * 100.0, (mean + std) * 100.0, color=colors[name], alpha=0.12)
+        if mode == "cumulative":
+            axis.axhline(data["legacy"] * 100.0, color="0.3", linestyle=":", label="Legacy full projected")
+            invalid = np.any(data["invalid"], axis=0)
+            if invalid.any():
+                axis.scatter(x[invalid], np.zeros(int(invalid.sum())), marker="x", color="red", label="Incomplete cap")
+        axis.axvline(float(self.current_viewer_config.coverage_cap_radius_fraction), color="red", linestyle="--", linewidth=1.0)
+        axis.set_xlabel("a/R" if mode == "cumulative" else "r/R", fontsize=7)
+        axis.set_ylabel("Metric [%]", fontsize=7)
+        axis.set_title("Cap coverage" if mode == "cumulative" else "Annular radial coverage", fontsize=8)
+        axis.tick_params(labelsize=6)
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=5.5, loc="best")
 
     def _render_overlays(self) -> None:
         show = (

@@ -66,23 +66,17 @@
     "ag_coverage_closing_radius": 1,
     "ag_coverage_use_union_with_count": true,
     "coverage_cap_enabled": true,
-    "coverage_cap_radius_fraction": 0.25,
+    "coverage_cap_radius_fraction": 0.33,
     "coverage_cap_min_completeness": 0.98,
     "sphere_diameter_metric": "mean_xy_diameter",
     "selected_cap_coverage_metric": "projected_fraction",
     "coverage_cap_graph_mode": "cumulative",
-    "coverage_homogeneity_enabled": true,
-    "homogeneity_inner_radius_fraction": 0.10,
-    "homogeneity_outer_radius_fraction": 0.75,
-    "radial_ring_width_fraction": 0.05,
-    "polar_sector_count": 12,
-    "homogeneity_min_segment_completeness": 0.95,
-    "homogeneity_view_mode": "radial",
     "default_show_scale": true,
     "default_show_bead_boundary": true,
     "default_show_diameter_lines": true,
     "default_show_ag_boundary": true,
     "default_show_ag_count_boundary": false,
-    "default_show_ag_peaks": false
+    "default_show_ag_peaks": false,
+    "coverage_cap_surface_weighting_enabled": false
   }
 }
