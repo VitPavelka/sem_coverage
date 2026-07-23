@@ -15,7 +15,9 @@ _XLSX_GEOMETRIC_FRACTION_COLUMNS = frozenset(
     {
         "radial_inner_fraction",
         "radial_outer_fraction",
-        "radial_center_fraction",
+        "radial_center_proj_fraction",
+        "radial_center_caps_fraction",
+        "radial_center_surfw_fraction",
         "inner_radius_fraction",
         "outer_radius_fraction",
     }

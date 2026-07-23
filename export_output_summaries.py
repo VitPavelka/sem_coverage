@@ -64,7 +64,9 @@ COVERAGE_RADIAL_PROFILE_COLUMNS = (
     "radial_band_index",
     "radial_inner_fraction",
     "radial_outer_fraction",
-    "radial_center_fraction",
+    "radial_center_proj_fraction",
+    "radial_center_caps_fraction",
+    "radial_center_surfw_fraction",
     "valid",
     "completeness",
     "proj_pct",
@@ -349,7 +351,9 @@ def build_compact_coverage_radial_profile_row(
         "radial_band_index": profile.get("radial_band_index"),
         "radial_inner_fraction": profile.get("radial_inner_fraction"),
         "radial_outer_fraction": profile.get("radial_outer_fraction"),
-        "radial_center_fraction": profile.get("radial_center_fraction"),
+        "radial_center_proj_fraction": profile.get("radial_center_proj_fraction"),
+        "radial_center_caps_fraction": profile.get("radial_center_caps_fraction"),
+        "radial_center_surfw_fraction": profile.get("radial_center_surfw_fraction"),
         "valid": profile.get("valid"),
         "completeness": profile.get("completeness"),
     }
@@ -409,6 +413,30 @@ def _sector_group_rows(
         entries = grouped[key]
         first = entries[0]
         valid_entries = [entry for entry in entries if entry.get("valid")]
+        exact_count_entries = [
+            entry
+            for entry in entries
+            if entry.get("theoretical_pixel_count") is not None
+            and entry.get("reference_pixel_count") is not None
+        ]
+        if len(exact_count_entries) == len(entries):
+            theoretical_count = sum(
+                int(entry["theoretical_pixel_count"])
+                for entry in exact_count_entries
+            )
+            reference_count = sum(
+                int(entry["reference_pixel_count"])
+                for entry in exact_count_entries
+            )
+            completeness = (
+                reference_count / theoretical_count
+                if theoretical_count > 0 else None
+            )
+        else:
+            # Early compact joint-grid JSON may contain only the already
+            # aggregated sector completeness.  Preserve it without attempting
+            # to reconstruct theoretical area from reference/completeness.
+            completeness = first.get("completeness") if len(entries) == 1 else None
         values: dict[str, object] = {
             **_detail_identity(data, image, roi),
             "rotation_index": first.get("rotation_index"),
@@ -417,11 +445,17 @@ def _sector_group_rows(
             "polar_start_deg": first.get("polar_start_deg"),
             "polar_end_deg": first.get("polar_end_deg"),
             "valid": bool(valid_entries),
-            "completeness": first.get("completeness"),
+            "completeness": completeness,
         }
         for short, metric in _DETAIL_METRICS:
-            numerator = sum(float(entry.get(f"{metric}_numerator") or 0.0) for entry in valid_entries)
-            denominator = sum(float(entry.get(f"{metric}_denominator") or 0.0) for entry in valid_entries)
+            numerator = sum(
+                float(entry.get(f"{metric}_numerator") or 0.0)
+                for entry in entries
+            )
+            denominator = sum(
+                float(entry.get(f"{metric}_denominator") or 0.0)
+                for entry in entries
+            )
             values[f"{short}_pct"] = numerator / denominator * 100.0 if denominator > 0 else None
         rows.append(_exact_detail_row(COVERAGE_POLAR_SECTOR_COLUMNS, values))
     return rows

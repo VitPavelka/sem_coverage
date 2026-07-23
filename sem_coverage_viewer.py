@@ -1402,13 +1402,6 @@ def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selecte
     local_record["radial_profile_details"] = []
     radial_band_count = len(result.radial_edges) - 1
     for radial_index in range(radial_band_count):
-        representative_centers = [
-            summary.radial_centers[radial_index]
-            for summary in result.metrics.values()
-            if summary.radial_centers is not None
-            and radial_index < len(summary.radial_centers)
-            and np.isfinite(summary.radial_centers[radial_index])
-        ]
         completeness_values = [
             summary.radial_completeness[radial_index]
             for summary in result.metrics.values()
@@ -1425,10 +1418,27 @@ def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selecte
             "radial_band_index": radial_index,
             "radial_inner_fraction": _safe_float(result.radial_edges[radial_index]),
             "radial_outer_fraction": _safe_float(result.radial_edges[radial_index + 1]),
-            "radial_center_fraction": _safe_float(representative_centers[0]) if representative_centers else _safe_float((result.radial_edges[radial_index] + result.radial_edges[radial_index + 1]) / 2.0),
             "valid": bool(any(valid_values)),
             "completeness": _safe_float(completeness_values[0]) if completeness_values else None,
         }
+        midpoint = (
+            result.radial_edges[radial_index]
+            + result.radial_edges[radial_index + 1]
+        ) / 2.0
+        for metric, field_name in (
+            ("projected_fraction", "radial_center_proj_fraction"),
+            ("projected_over_cap_surface", "radial_center_caps_fraction"),
+            ("surface_weighted_fraction", "radial_center_surfw_fraction"),
+        ):
+            summary = result.metrics[metric]
+            center = (
+                summary.radial_centers[radial_index]
+                if summary.radial_centers is not None
+                and radial_index < len(summary.radial_centers)
+                and np.isfinite(summary.radial_centers[radial_index])
+                else midpoint
+            )
+            profile_item[field_name] = _safe_float(center)
         for metric, summary in result.metrics.items():
             value = summary.radial_profile[radial_index] if radial_index < len(summary.radial_profile) else float("nan")
             profile_item[f"{metric}_percent"] = _safe_float(value * 100.0) if np.isfinite(value) else None
@@ -1444,27 +1454,37 @@ def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selecte
     record["local_rotation_summaries"] = []
     record["local_rotation_sector_profiles"] = []
     for rotation_index, rotation in enumerate(result.rotation_results):
+        sector_cells_by_index = {
+            sector_index: [
+                cell
+                for cell in rotation.cells
+                if cell.sector_index == sector_index
+            ]
+            for sector_index in range(len(rotation.sector_edges_deg) - 1)
+        }
+        sector_validity = {
+            sector_index: any(cell.valid for cell in sector_cells)
+            for sector_index, sector_cells in sector_cells_by_index.items()
+        }
         for metric, summary in rotation.metrics.items():
             valid_cells = [cell for cell in rotation.cells if cell.valid]
             record["local_rotation_summaries"].append({
                 "rotation_index": rotation_index, "rotation_offset_deg": _safe_float(rotation.display_rotation_deg), "metric": metric,
-                "valid_sector_count": int(np.count_nonzero(summary.polar_valid)) if summary.polar_valid is not None else int(np.isfinite(summary.polar_profile).sum()), "valid_cell_count": len(valid_cells),
+                "valid_sector_count": int(sum(sector_validity.values())), "valid_cell_count": len(valid_cells),
                 "polar_sd_pp": _safe_float(summary.polar_weighted_sd_pp), "polar_mad_pp": _safe_float(summary.polar_weighted_mad_pp),
                 "local_total_sd_pp": _safe_float(summary.total_weighted_sd_pp), "local_total_mad_pp": _safe_float(summary.total_weighted_mad_pp),
                 "local_residual_sd_pp": _safe_float(summary.residual_weighted_sd_pp), "local_residual_mad_pp": _safe_float(summary.residual_weighted_mad_pp),
                 "reconstructed_coverage_pct": _safe_float(summary.reconstructed.value * 100.0) if summary.reconstructed.value is not None else None, "reconstruction_delta_pp": _safe_float(summary.reconstruction_delta_pp),
             })
         # One compact sector profile per robust rotation.  Its metric values
-        # are sums of valid cell numerators/denominators, never arithmetic
-        # means of cell percentages.
+        # are sums of every cell's numerators/denominators, never arithmetic
+        # means of cell percentages.  Cell validity remains separate from the
+        # all-cell population used for reconstruction.
         for sector_index in range(len(rotation.sector_edges_deg) - 1):
-            sector_cells = [cell for cell in rotation.cells if cell.sector_index == sector_index]
-            valid_sector_cells = [cell for cell in sector_cells if cell.valid]
+            sector_cells = sector_cells_by_index[sector_index]
             reference_pixels = sum(cell.reference_pixel_count for cell in sector_cells)
             theoretical_pixels = sum(
-                cell.reference_pixel_count / cell.completeness
-                for cell in sector_cells
-                if cell.completeness > 0.0
+                cell.theoretical_pixel_count for cell in sector_cells
             )
             item = {
                 "rotation_index": rotation_index,
@@ -1472,12 +1492,22 @@ def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selecte
                 "polar_sector_index": sector_index,
                 "polar_start_deg": _safe_float(rotation.display_rotation_deg + rotation.sector_edges_deg[sector_index]),
                 "polar_end_deg": _safe_float(rotation.display_rotation_deg + rotation.sector_edges_deg[sector_index + 1]),
-                "valid": bool(valid_sector_cells),
+                "valid": bool(sector_validity[sector_index]),
+                "theoretical_pixel_count": int(theoretical_pixels),
+                "reference_pixel_count": int(reference_pixels),
                 "completeness": _safe_float(reference_pixels / theoretical_pixels) if theoretical_pixels > 0.0 else None,
             }
             for metric in CAP_COVERAGE_METRICS:
-                numerator = sum(cell.components(metric).numerator for cell in valid_sector_cells)
-                denominator = sum(cell.components(metric).denominator for cell in valid_sector_cells)
+                # Reconstruction uses every cell with a defined metric
+                # component, including cells that fail the local completeness
+                # threshold.  This is the same population used by the backend
+                # rotation reconstruction.
+                numerator = sum(
+                    cell.components(metric).numerator for cell in sector_cells
+                )
+                denominator = sum(
+                    cell.components(metric).denominator for cell in sector_cells
+                )
                 item[f"{metric}_numerator"] = _safe_float(numerator)
                 item[f"{metric}_denominator"] = _safe_float(denominator)
                 item[f"{metric}_percent"] = _safe_float(numerator / denominator * 100.0) if denominator > 0.0 else None
@@ -1495,6 +1525,7 @@ def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selecte
             "center_angle_deg": _safe_float((cell.start_angle_deg + cell.end_angle_deg) / 2.0),
             "valid": bool(cell.valid),
             "completeness": _safe_float(cell.completeness),
+            "theoretical_pixel_count": int(cell.theoretical_pixel_count),
             "reference_pixel_count": int(cell.reference_pixel_count),
             "ag_pixel_count": int(cell.ag_pixel_count),
         }

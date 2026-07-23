@@ -98,6 +98,7 @@ class LocalGridCell:
     start_angle_deg: float
     end_angle_deg: float
     completeness: float
+    theoretical_pixel_count: int
     reference_pixel_count: int
     ag_pixel_count: int
     valid: bool
@@ -677,7 +678,22 @@ def compute_local_grid_from_workspace(
         cell_valid = bool(valid[radial_i, sector_i])
         start_deg = math.degrees(start) + rotation_offset_deg
         end_deg = math.degrees(end) + rotation_offset_deg
-        cell = LocalGridCell(radial_i, sector_i, float(low), float(high), float(start_deg), float(end_deg), completeness_cell, int(count), int(ag_count), cell_valid, projected, weighted, over_surface)
+        cell = LocalGridCell(
+            radial_i,
+            sector_i,
+            float(low),
+            float(high),
+            float(start_deg),
+            float(end_deg),
+            completeness_cell,
+            int(theoretical_counts[cell_id]),
+            int(count),
+            int(ag_count),
+            cell_valid,
+            projected,
+            weighted,
+            over_surface,
+        )
         cells.append(cell)
         for name, component in (("projected_fraction", projected), ("surface_weighted_fraction", weighted), ("projected_over_cap_surface", over_surface)):
             components_by_metric[name].append(component)
