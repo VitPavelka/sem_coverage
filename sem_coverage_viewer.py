@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import configparser
 import json
@@ -31,12 +31,22 @@ from path_utils import (
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
 from tabular_export import sort_paths
 from coverage_cap import (
+    CAP_COVERAGE_METRICS,
+    CapRadiusSensitivity,
     CoverageCapMetrics,
+    cap_sensitivity_fractions,
+    cumulative_cap_sweep,
     compute_coverage_cap_metrics,
     normalize_cap_coverage_metric,
     normalize_sphere_diameter_metric,
-    sphere_diameter_px as _cap_sphere_diameter_px,
+    maximum_inscribed_circle,
+    sphere_geometry_from_mask,
+    summarize_cap_sensitivity,
 )
+from coverage_local_heterogeneity import LocalHeterogeneityResult, compute_local_heterogeneity
+
+if TYPE_CHECKING:
+    from coverage_homogeneity import CoverageHomogeneityResult
 
 
 @dataclass(frozen=True)
@@ -76,7 +86,7 @@ class CoverageViewerConfig:
     ag_coverage_adaptive_block_size: int = 151
     ag_coverage_adaptive_k_std: float = 2.0
     ag_coverage_min_object_size: int = 9
-    ag_coverage_closing_radius: int = 1
+    ag_coverage_closing_radius: int = 0
     ag_coverage_use_union_with_count: bool = True
     # Central-cap post-processing affects only final coverage reporting; bead
     # and Ag segmentation masks are always produced by the existing pipeline.
@@ -84,8 +94,12 @@ class CoverageViewerConfig:
     coverage_cap_radius_fraction: float = 0.25
     coverage_cap_min_completeness: float = 0.98
     sphere_diameter_metric: str = "mean_xy_diameter"
-    selected_cap_coverage_metric: str = "projected_fraction"
+    selected_cap_coverage_metric: str = "projected_over_cap_surface"
     coverage_cap_graph_mode: str = "cumulative"
+    coverage_cap_annulus_width_fraction: float = 0.05
+    coverage_cap_sensitivity_enabled: bool = True
+    coverage_cap_sensitivity_half_width: float = 0.05
+    coverage_cap_sensitivity_step_fraction: float = 0.01
     coverage_homogeneity_enabled: bool = True
     homogeneity_inner_radius_fraction: float = 0.10
     homogeneity_outer_radius_fraction: float = 0.75
@@ -93,6 +107,20 @@ class CoverageViewerConfig:
     polar_sector_count: int = 12
     homogeneity_min_segment_completeness: float = 0.95
     homogeneity_view_mode: str = "radial"
+    polar_rotation_samples: int = 12
+    polar_display_rotation_deg: float = 0.0
+    # Diagnostic-only shared local polar-grid settings.  They operate on
+    # existing masks and never affect production segmentation.
+    local_heterogeneity_enabled: bool = True
+    local_heterogeneity_inner_radius_fraction: float = 0.10
+    local_heterogeneity_outer_radius_fraction: float = 0.75
+    local_heterogeneity_radial_band_count: int = 8
+    local_heterogeneity_polar_sector_count: int = 12
+    local_heterogeneity_polar_rotation_samples: int = 12
+    local_heterogeneity_display_rotation_deg: float = 0.0
+    local_heterogeneity_min_segment_completeness: float = 0.95
+    local_heterogeneity_show_heatmap: bool = True
+    local_heterogeneity_show_1d_profiles: bool = True
     # Deprecated compatibility field.  All explicit cap metrics are now
     # available; it no longer selects the primary reported cap metric.
     coverage_cap_surface_weighting_enabled: bool = False
@@ -106,7 +134,7 @@ class CoverageViewerConfig:
 
 @dataclass(frozen=True)
 class CoverageAppConfig:
-    folder: str
+    folder: str = ""
     file: Optional[str] = None
     viewer: CoverageViewerConfig = CoverageViewerConfig()
     summary_json_path: Optional[str] = None
@@ -154,6 +182,9 @@ class BeadMetrics:
     sphere_radius_px: float
     sphere_radius_m: Optional[float]
     sphere_volume_m3: Optional[float]
+    # The measurement centroid remains available for geometric overlays; this
+    # optional center is the sphere/cap reference selected by the active mode.
+    sphere_center_rc: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +217,9 @@ class BeadCoverageResult:
     cap_projected_over_surface_coverage: float | None = None
     cap_projected_over_surface_coverage_percent: float | None = None
     selected_coverage_method: str = "legacy_full_projected"
+    cap_sensitivity: dict[str, CapRadiusSensitivity] = field(default_factory=dict)
+    homogeneity: CoverageHomogeneityResult | None = None
+    local_heterogeneity: LocalHeterogeneityResult | None = None
 
 
 @dataclass(frozen=True)
@@ -303,12 +337,42 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
             viewer.selected_cap_coverage_metric
         ),
     )
+    _validate_postprocessing_config(viewer)
     return CoverageAppConfig(
-        folder=data["folder"],
+        folder=str(data.get("folder") or ""),
         file=data.get("file") or None,
         viewer=viewer,
         summary_json_path=data.get("summary_json_path"),
     )
+
+
+def _validate_postprocessing_config(config: CoverageViewerConfig) -> None:
+    """Validate additive cap/homogeneity settings without affecting segmentation."""
+
+    if not (0.0 < config.coverage_cap_radius_fraction <= 1.0):
+        raise ValueError("coverage_cap_radius_fraction must satisfy 0 < value <= 1.")
+    if not (0.0 <= config.coverage_cap_min_completeness <= 1.0):
+        raise ValueError("coverage_cap_min_completeness must be between 0 and 1.")
+    if not (0.0 <= config.coverage_cap_sensitivity_half_width < 1.0):
+        raise ValueError("coverage_cap_sensitivity_half_width must satisfy 0 <= value < 1.")
+    if not (0.0 < config.coverage_cap_sensitivity_step_fraction <= 1.0):
+        raise ValueError("coverage_cap_sensitivity_step_fraction must satisfy 0 < value <= 1.")
+    if config.polar_rotation_samples < 1 or not math.isfinite(config.polar_display_rotation_deg):
+        raise ValueError("Polar rotation settings are invalid.")
+    if not (0 <= config.homogeneity_inner_radius_fraction < config.homogeneity_outer_radius_fraction <= 1):
+        raise ValueError("Homogeneity inner/outer radius fractions are invalid.")
+    if not (0 < config.radial_ring_width_fraction <= config.homogeneity_outer_radius_fraction - config.homogeneity_inner_radius_fraction):
+        raise ValueError("radial_ring_width_fraction is invalid.")
+    if config.polar_sector_count < 2 or not (0 <= config.homogeneity_min_segment_completeness <= 1):
+        raise ValueError("Homogeneity sector/completeness settings are invalid.")
+    if not (0 <= config.local_heterogeneity_inner_radius_fraction < config.local_heterogeneity_outer_radius_fraction <= 1):
+        raise ValueError("Local heterogeneity inner/outer radius fractions are invalid.")
+    if config.local_heterogeneity_radial_band_count < 1 or config.local_heterogeneity_polar_sector_count < 2:
+        raise ValueError("Local heterogeneity band/sector counts are invalid.")
+    if not (0 <= config.local_heterogeneity_min_segment_completeness <= 1):
+        raise ValueError("Local heterogeneity completeness is invalid.")
+    if config.local_heterogeneity_polar_rotation_samples < 1 or not math.isfinite(config.local_heterogeneity_display_rotation_deg):
+        raise ValueError("Local heterogeneity rotation settings are invalid.")
 
 
 def save_default_config(config_path: str | Path, folder: str | Path) -> None:
@@ -759,10 +823,16 @@ def _measure_bead(
     eqd_m = _scaled(eqd_px)
     # Coverage uses the same X/Y bounding-box diameters shown by the viewer.
     # This is deliberately separate from equivalent diameter and major/minor.
-    sphere_diameter_px = _cap_sphere_diameter_px(
-        eqd_px, x_px, y_px, sphere_diameter_metric
+    geometry = sphere_geometry_from_mask(
+        bead_mask,
+        centroid_rc=(float(region.centroid[0]), float(region.centroid[1])),
+        equivalent_diameter_px=eqd_px,
+        x_diameter_px=x_px,
+        y_diameter_px=y_px,
+        metric=sphere_diameter_metric,
     )
-    sphere_radius_px = float(sphere_diameter_px / 2.0)
+    sphere_radius_px = float(geometry.radius_px)
+    sphere_diameter_px = float(2.0 * sphere_radius_px)
     sphere_diameter_m = _scaled(sphere_diameter_px)
     sphere_radius_m = _scaled(sphere_radius_px)
     sphere_area = None
@@ -791,6 +861,7 @@ def _measure_bead(
         sphere_radius_px=sphere_radius_px,
         sphere_radius_m=sphere_radius_m,
         sphere_volume_m3=sphere_volume,
+        sphere_center_rc=geometry.center_rc,
     )
 
 
@@ -868,7 +939,7 @@ def _build_roi_result(
     cap_metrics = compute_coverage_cap_metrics(
         bead_mask,
         ag_mask,
-        bead_metrics.centroid_rc,
+        bead_metrics.sphere_center_rc or bead_metrics.centroid_rc,
         bead_metrics.sphere_radius_px,
         config.coverage_cap_radius_fraction,
         pixel_size_m,
@@ -877,6 +948,37 @@ def _build_roi_result(
     )
     selected_cap_metric = normalize_cap_coverage_metric(config.selected_cap_coverage_metric)
     selected_cap_value = cap_metrics.selected_value(selected_cap_metric)
+    cap_sensitivity: dict[str, CapRadiusSensitivity] = {}
+    if config.coverage_cap_sensitivity_enabled:
+        fractions = cap_sensitivity_fractions(
+            config.coverage_cap_radius_fraction,
+            config.coverage_cap_sensitivity_half_width,
+            config.coverage_cap_sensitivity_step_fraction,
+        )
+        sweep = cumulative_cap_sweep(
+            bead_mask, ag_mask, bead_metrics.sphere_center_rc or bead_metrics.centroid_rc, bead_metrics.sphere_radius_px,
+            fractions, pixel_size_m, min_completeness=config.coverage_cap_min_completeness,
+        )
+        cap_sensitivity = {
+            name: summarize_cap_sensitivity(sweep, name) for name in CAP_COVERAGE_METRICS
+        }
+    sphere_center = bead_metrics.sphere_center_rc or bead_metrics.centroid_rc
+    # Legacy radial/polar homogeneity remains available through the diagnostic
+    # adapter, but is not calculated by production/batch scientific analysis.
+    homogeneity: CoverageHomogeneityResult | None = None
+    local_heterogeneity: LocalHeterogeneityResult | None = None
+    if config.local_heterogeneity_enabled:
+        local_heterogeneity = compute_local_heterogeneity(
+            bead_mask, ag_mask, sphere_center, bead_metrics.sphere_radius_px,
+            inner_fraction=config.local_heterogeneity_inner_radius_fraction,
+            outer_fraction=config.local_heterogeneity_outer_radius_fraction,
+            radial_band_count=config.local_heterogeneity_radial_band_count,
+            polar_sector_count=config.local_heterogeneity_polar_sector_count,
+            min_segment_completeness=config.local_heterogeneity_min_segment_completeness,
+            metric=selected_cap_metric,
+            polar_rotation_samples=config.local_heterogeneity_polar_rotation_samples,
+            display_rotation_deg=config.local_heterogeneity_display_rotation_deg,
+        )
     if config.coverage_cap_enabled and cap_metrics.valid and selected_cap_value is not None:
         coverage = float(selected_cap_value)
         selected_method = f"cap_{selected_cap_metric}"
@@ -929,6 +1031,9 @@ def _build_roi_result(
             else None
         ),
         selected_coverage_method=selected_method,
+        cap_sensitivity=cap_sensitivity,
+        homogeneity=homogeneity,
+        local_heterogeneity=local_heterogeneity,
     )
 
 
@@ -1134,34 +1239,383 @@ def _resolve_image_paths(folder: str | Path, file: Optional[str] = None) -> list
     return sort_paths(list(folder.glob("*.tif")))
 
 
-def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, file: Optional[str] = None) -> dict:
+def _metric_components_record(components) -> dict[str, float | None]:
+    """Serialize one shared post-processing component triple for JSON output."""
+
+    return {
+        "numerator": _safe_float(components.numerator),
+        "denominator": _safe_float(components.denominator),
+        "fraction": _safe_float(components.value),
+        "percent": _safe_float(components.value * 100.0) if components.value is not None else None,
+    }
+
+
+def _segment_record(segment) -> dict:
+    values = {
+        "index": segment.index,
+        "inner_radius_fraction": _safe_float(segment.inner),
+        "outer_radius_fraction": _safe_float(segment.outer),
+        "center_radius_fraction": _safe_float(segment.center),
+        "valid": bool(segment.valid),
+        "completeness": _safe_float(segment.completeness),
+        "bead_pixel_count": int(segment.bead_pixel_count),
+        "ag_pixel_count": int(segment.ag_pixel_count),
+        "surface_area_px2": _safe_float(segment.surface_area_px2),
+    }
+    if segment.start_angle_deg is not None:
+        values["start_angle_deg"] = _safe_float(segment.start_angle_deg)
+        values["end_angle_deg"] = _safe_float(segment.end_angle_deg)
+        values["center_angle_deg"] = _safe_float((segment.start_angle_deg + (segment.end_angle_deg - segment.start_angle_deg) % 360.0 / 2.0) % 360.0)
+    for metric in CAP_COVERAGE_METRICS:
+        component = segment.components(metric)
+        prefix = metric
+        values.update({
+            f"{prefix}_numerator": _safe_float(component.numerator),
+            f"{prefix}_denominator": _safe_float(component.denominator),
+            f"{prefix}_fraction": _safe_float(component.value),
+            f"{prefix}_percent": _safe_float(component.value * 100.0) if component.value is not None else None,
+        })
+    return values
+
+
+def _homogeneity_record(result: CoverageHomogeneityResult | None, selected_metric: str) -> dict:
+    """Serialize shared homogeneity results without including masks/maps."""
+
+    if result is None:
+        return {"homogeneity_enabled": False, "radial_ring_results": [], "polar_display_rotation_sector_results": [], "polar_rotation_summaries": []}
+    record: dict = {
+        "homogeneity_enabled": True,
+        "homogeneity_inner_radius_fraction": result.rings[0].inner if result.rings else None,
+        "homogeneity_outer_radius_fraction": result.rings[-1].outer if result.rings else None,
+        "requested_radial_ring_width_fraction": result.requested_radial_ring_width_fraction,
+        "effective_radial_ring_width_fraction": result.effective_radial_ring_width_fraction,
+        "polar_display_rotation_deg": result.display_rotation_deg,
+        "radial_ring_results": [_segment_record(item) for item in result.rings],
+        "polar_display_rotation_sector_results": [_segment_record(item) for item in result.sectors],
+        "polar_rotation_summaries": [],
+    }
+    for metric in CAP_COVERAGE_METRICS:
+        direct = result.direct_domain_components[metric]
+        radial = result.radial_reconstructed_components[metric]
+        polar = result.polar_reconstructed_components[metric]
+        for label, component in (("direct_domain", direct), ("radial_reconstructed", radial), ("polar_reconstructed", polar)):
+            record[f"{metric}_{label}_fraction"] = _safe_float(component.value)
+            record[f"{metric}_{label}_percent"] = _safe_float(component.value * 100.0) if component.value is not None else None
+        record[f"{metric}_radial_partition_delta_pp"] = _safe_float(result.radial_partition_delta_pp[metric])
+        record[f"{metric}_polar_partition_delta_pp"] = _safe_float(result.polar_partition_delta_pp[metric])
+        record[f"{metric}_radial_polar_partition_delta_pp"] = _safe_float(result.radial_polar_partition_delta_pp[metric])
+        radial_summary = result.radial_summaries_by_metric[metric]
+        for prefix, summary in ((f"{metric}_radial", radial_summary),):
+            record.update({
+                f"{prefix}_weighted_mean_percent": _safe_float(summary.weighted_mean * 100.0) if summary.weighted_mean is not None else None,
+                f"{prefix}_weighted_sd_pp": _safe_float(summary.weighted_sd_pp),
+                f"{prefix}_weighted_median_percent": _safe_float(summary.weighted_median * 100.0) if summary.weighted_median is not None else None,
+                f"{prefix}_weighted_mad_pp": _safe_float(summary.weighted_mad_pp),
+                f"{prefix}_range_pp": _safe_float(summary.range_pp),
+                f"{prefix}_slope_pp_per_R": _safe_float(summary.slope_pp_per_R),
+                f"{prefix}_valid_ring_count": summary.valid_count,
+            })
+        aggregate = result.polar_rotation_aggregates[metric]
+        for field_name in ("sd_median_pp", "sd_q10_pp", "sd_q90_pp", "sd_iqr_pp", "sd_range_pp", "mad_median_pp", "mad_q10_pp", "mad_q90_pp", "mad_iqr_pp", "partition_delta_max_pp"):
+            record[f"{metric}_polar_rotation_{field_name}"] = _safe_float(getattr(aggregate, field_name))
+    # Generic aliases always identify their selected metric in the same record.
+    record.update({
+        "radial_weighted_sd_pp": record.get(f"{selected_metric}_radial_weighted_sd_pp"),
+        "radial_weighted_mad_pp": record.get(f"{selected_metric}_radial_weighted_mad_pp"),
+        "radial_coverage_slope_pp_per_R": record.get(f"{selected_metric}_radial_slope_pp_per_R"),
+        "polar_rotation_sd_median_pp": record.get(f"{selected_metric}_polar_rotation_sd_median_pp"),
+        "polar_rotation_sd_iqr_pp": record.get(f"{selected_metric}_polar_rotation_sd_iqr_pp"),
+        "radial_partition_delta_pp": record.get(f"{selected_metric}_radial_partition_delta_pp"),
+        "polar_partition_delta_pp": record.get(f"{selected_metric}_polar_partition_delta_pp"),
+        "radial_polar_partition_delta_pp": record.get(f"{selected_metric}_radial_polar_partition_delta_pp"),
+    })
+    for rotation in result.polar_rotation_summaries:
+        item = {"rotation_index": rotation.rotation_index, "rotation_offset_deg": rotation.rotation_offset_deg}
+        for metric, summary in rotation.summaries_by_metric.items():
+            item.update({
+                f"{metric}_reconstructed_coverage_percent": _safe_float(summary.reconstructed_coverage * 100.0) if summary.reconstructed_coverage is not None else None,
+                f"{metric}_weighted_sd_pp": _safe_float(summary.weighted_sd_pp),
+                f"{metric}_weighted_mad_pp": _safe_float(summary.weighted_mad_pp),
+                f"{metric}_range_pp": _safe_float(summary.range_pp),
+            })
+        record["polar_rotation_summaries"].append(item)
+    return record
+
+
+def _local_heterogeneity_record(result: LocalHeterogeneityResult | None, selected_metric: str) -> dict:
+    """Serialize shared direct-domain/local-grid data without full-size maps."""
+
+    if result is None:
+        return {
+            "homogeneity_domain": None,
+            "local_heterogeneity": None,
+            "local_grid_cells": [],
+        }
+    domain = result.domain
+    record: dict[str, object] = {
+        "homogeneity_domain": {},
+        "local_heterogeneity": {},
+        "local_grid_cells": [],
+    }
+    domain_record = record["homogeneity_domain"]
+    assert isinstance(domain_record, dict)
+    domain_record.update({
+        "inner_radius_fraction": _safe_float(domain.inner_radius_fraction),
+        "outer_radius_fraction": _safe_float(domain.outer_radius_fraction),
+        "completeness": _safe_float(domain.completeness),
+        "valid": bool(domain.valid),
+    })
+    for metric in CAP_COVERAGE_METRICS:
+        component = domain.components(metric)
+        domain_record.update({
+            f"{metric}_numerator": _safe_float(component.numerator),
+            f"{metric}_denominator": _safe_float(component.denominator),
+            f"{metric}_fraction": _safe_float(component.value),
+            f"{metric}_percent": _safe_float(component.value * 100.0) if component.value is not None else None,
+        })
+    local_record = record["local_heterogeneity"]
+    assert isinstance(local_record, dict)
+    local_record.update({
+        "radial_band_count": int(result.values.shape[0]),
+        "polar_sector_count": int(result.values.shape[1]),
+        "display_rotation_deg": _safe_float(result.display_rotation_deg),
+        "valid": bool(result.scientifically_valid),
+    })
+    for metric, summary in result.metrics.items():
+        local_record.update({
+            f"{metric}_valid": bool(result.metric_validity.get(metric, False)),
+            f"{metric}_reconstructed_fraction": _safe_float(summary.reconstructed.value),
+            f"{metric}_reconstructed_percent": _safe_float(summary.reconstructed.value * 100.0) if summary.reconstructed.value is not None else None,
+            f"{metric}_reconstruction_delta_pp": _safe_float(summary.reconstruction_delta_pp),
+            f"{metric}_total_weighted_sd_pp": _safe_float(summary.total_weighted_sd_pp),
+            f"{metric}_total_weighted_mad_pp": _safe_float(summary.total_weighted_mad_pp),
+            f"{metric}_residual_weighted_sd_pp": _safe_float(summary.residual_weighted_sd_pp),
+            f"{metric}_residual_weighted_mad_pp": _safe_float(summary.residual_weighted_mad_pp),
+            f"{metric}_radial_weighted_sd_pp": _safe_float(summary.radial_weighted_sd_pp),
+            f"{metric}_radial_slope_pp_per_R": _safe_float(summary.radial_slope_pp_per_R),
+            f"{metric}_radial_profile": [_safe_float(value) for value in summary.radial_profile],
+            f"{metric}_polar_profile": [_safe_float(value) for value in summary.polar_profile],
+        })
+    # The direct annular profile is intentionally serialized separately from
+    # display-grid cells.  It is fixed by radial bands and does not inherit any
+    # polar-sector completeness or display-rotation dependence.
+    local_record["radial_profile_details"] = []
+    radial_band_count = len(result.radial_edges) - 1
+    for radial_index in range(radial_band_count):
+        representative_centers = [
+            summary.radial_centers[radial_index]
+            for summary in result.metrics.values()
+            if summary.radial_centers is not None
+            and radial_index < len(summary.radial_centers)
+            and np.isfinite(summary.radial_centers[radial_index])
+        ]
+        completeness_values = [
+            summary.radial_completeness[radial_index]
+            for summary in result.metrics.values()
+            if summary.radial_completeness is not None
+            and radial_index < len(summary.radial_completeness)
+        ]
+        valid_values = [
+            bool(summary.radial_valid[radial_index])
+            for summary in result.metrics.values()
+            if summary.radial_valid is not None
+            and radial_index < len(summary.radial_valid)
+        ]
+        profile_item: dict[str, object] = {
+            "radial_band_index": radial_index,
+            "radial_inner_fraction": _safe_float(result.radial_edges[radial_index]),
+            "radial_outer_fraction": _safe_float(result.radial_edges[radial_index + 1]),
+            "radial_center_fraction": _safe_float(representative_centers[0]) if representative_centers else _safe_float((result.radial_edges[radial_index] + result.radial_edges[radial_index + 1]) / 2.0),
+            "valid": bool(any(valid_values)),
+            "completeness": _safe_float(completeness_values[0]) if completeness_values else None,
+        }
+        for metric, summary in result.metrics.items():
+            value = summary.radial_profile[radial_index] if radial_index < len(summary.radial_profile) else float("nan")
+            profile_item[f"{metric}_percent"] = _safe_float(value * 100.0) if np.isfinite(value) else None
+        local_record["radial_profile_details"].append(profile_item)
+    for metric, aggregate in (result.rotation_aggregates or {}).items():
+        for field_name in (
+            "polar_sd_median_pp", "total_local_sd_median_pp",
+            "residual_sd_median_pp",
+        ):
+            local_record[f"{metric}_{field_name}"] = _safe_float(
+                getattr(aggregate, field_name)
+            )
+    record["local_rotation_summaries"] = []
+    record["local_rotation_sector_profiles"] = []
+    for rotation_index, rotation in enumerate(result.rotation_results):
+        for metric, summary in rotation.metrics.items():
+            valid_cells = [cell for cell in rotation.cells if cell.valid]
+            record["local_rotation_summaries"].append({
+                "rotation_index": rotation_index, "rotation_offset_deg": _safe_float(rotation.display_rotation_deg), "metric": metric,
+                "valid_sector_count": int(np.count_nonzero(summary.polar_valid)) if summary.polar_valid is not None else int(np.isfinite(summary.polar_profile).sum()), "valid_cell_count": len(valid_cells),
+                "polar_sd_pp": _safe_float(summary.polar_weighted_sd_pp), "polar_mad_pp": _safe_float(summary.polar_weighted_mad_pp),
+                "local_total_sd_pp": _safe_float(summary.total_weighted_sd_pp), "local_total_mad_pp": _safe_float(summary.total_weighted_mad_pp),
+                "local_residual_sd_pp": _safe_float(summary.residual_weighted_sd_pp), "local_residual_mad_pp": _safe_float(summary.residual_weighted_mad_pp),
+                "reconstructed_coverage_pct": _safe_float(summary.reconstructed.value * 100.0) if summary.reconstructed.value is not None else None, "reconstruction_delta_pp": _safe_float(summary.reconstruction_delta_pp),
+            })
+        # One compact sector profile per robust rotation.  Its metric values
+        # are sums of valid cell numerators/denominators, never arithmetic
+        # means of cell percentages.
+        for sector_index in range(len(rotation.sector_edges_deg) - 1):
+            sector_cells = [cell for cell in rotation.cells if cell.sector_index == sector_index]
+            valid_sector_cells = [cell for cell in sector_cells if cell.valid]
+            reference_pixels = sum(cell.reference_pixel_count for cell in sector_cells)
+            theoretical_pixels = sum(
+                cell.reference_pixel_count / cell.completeness
+                for cell in sector_cells
+                if cell.completeness > 0.0
+            )
+            item = {
+                "rotation_index": rotation_index,
+                "rotation_offset_deg": _safe_float(rotation.display_rotation_deg),
+                "polar_sector_index": sector_index,
+                "polar_start_deg": _safe_float(rotation.display_rotation_deg + rotation.sector_edges_deg[sector_index]),
+                "polar_end_deg": _safe_float(rotation.display_rotation_deg + rotation.sector_edges_deg[sector_index + 1]),
+                "valid": bool(valid_sector_cells),
+                "completeness": _safe_float(reference_pixels / theoretical_pixels) if theoretical_pixels > 0.0 else None,
+            }
+            for metric in CAP_COVERAGE_METRICS:
+                numerator = sum(cell.components(metric).numerator for cell in valid_sector_cells)
+                denominator = sum(cell.components(metric).denominator for cell in valid_sector_cells)
+                item[f"{metric}_numerator"] = _safe_float(numerator)
+                item[f"{metric}_denominator"] = _safe_float(denominator)
+                item[f"{metric}_percent"] = _safe_float(numerator / denominator * 100.0) if denominator > 0.0 else None
+            record["local_rotation_sector_profiles"].append(item)
+    for cell in result.cells:
+        item = {
+            "rotation_offset_deg": _safe_float(result.display_rotation_deg),
+            "radial_index": cell.radial_index,
+            "sector_index": cell.sector_index,
+            "inner_radius_fraction": _safe_float(cell.inner_fraction),
+            "outer_radius_fraction": _safe_float(cell.outer_fraction),
+            "center_radius_fraction": _safe_float((cell.inner_fraction + cell.outer_fraction) / 2.0),
+            "start_angle_deg": _safe_float(cell.start_angle_deg),
+            "end_angle_deg": _safe_float(cell.end_angle_deg),
+            "center_angle_deg": _safe_float((cell.start_angle_deg + cell.end_angle_deg) / 2.0),
+            "valid": bool(cell.valid),
+            "completeness": _safe_float(cell.completeness),
+            "reference_pixel_count": int(cell.reference_pixel_count),
+            "ag_pixel_count": int(cell.ag_pixel_count),
+        }
+        for metric in CAP_COVERAGE_METRICS:
+            component = cell.components(metric)
+            item.update({
+                f"{metric}_numerator": _safe_float(component.numerator),
+                f"{metric}_denominator": _safe_float(component.denominator),
+                f"{metric}_fraction": _safe_float(component.value),
+                f"{metric}_percent": _safe_float(component.value * 100.0) if component.value is not None else None,
+            })
+        record["local_grid_cells"].append(item)
+    # Scalar aliases are deliberately explicit about the selected metric.
+    selected = normalize_cap_coverage_metric(selected_metric)
+    selected_domain = domain.components(selected)
+    selected_grid = result.metrics[selected]
+    record.update({
+        "homogeneity_domain_inner_radius_fraction": _safe_float(domain.inner_radius_fraction),
+        "homogeneity_domain_outer_radius_fraction": _safe_float(domain.outer_radius_fraction),
+        "homogeneity_domain_completeness": _safe_float(domain.completeness),
+        "homogeneity_domain_valid": bool(domain.valid),
+        "primary_homogeneity_domain_coverage_fraction": _safe_float(selected_domain.value),
+        "primary_homogeneity_domain_coverage_percent": _safe_float(selected_domain.value * 100.0) if selected_domain.value is not None else None,
+        "primary_local_grid_reconstruction_delta_pp": _safe_float(selected_grid.reconstruction_delta_pp),
+        "local_total_weighted_sd_pp": _safe_float(selected_grid.total_weighted_sd_pp),
+        "local_total_weighted_mad_pp": _safe_float(selected_grid.total_weighted_mad_pp),
+        "local_residual_weighted_sd_pp": _safe_float(selected_grid.residual_weighted_sd_pp),
+        "local_residual_weighted_mad_pp": _safe_float(selected_grid.residual_weighted_mad_pp),
+    })
+    for metric in CAP_COVERAGE_METRICS:
+        component = domain.components(metric)
+        record[f"homogeneity_domain_{metric}"] = _safe_float(component.value)
+        record[f"homogeneity_domain_{metric}_percent"] = _safe_float(component.value * 100.0) if component.value is not None else None
+        record[f"local_grid_reconstructed_{metric}_percent"] = local_record.get(f"{metric}_reconstructed_percent")
+        record[f"local_grid_{metric}_delta_pp"] = local_record.get(f"{metric}_reconstruction_delta_pp")
+    return record
+
+
+def _cap_sensitivity_record(values: dict[str, CapRadiusSensitivity], selected_metric: str) -> dict:
+    record: dict = {}
+    for metric, summary in values.items():
+        prefix = f"{metric}_sensitivity"
+        for field_name in ("point_count", "interval_low_fraction", "interval_high_fraction", "median_percent", "q10_percent", "q90_percent", "q10_q90_half_width_pp", "half_range_pp", "slope_pp_per_R"):
+            record[f"{prefix}_{field_name}"] = _safe_float(getattr(summary, field_name))
+    for field_name in ("q10_q90_half_width_pp", "half_range_pp", "slope_pp_per_R"):
+        record[f"primary_cap_radius_sensitivity_{field_name}"] = record.get(f"{selected_metric}_sensitivity_{field_name}")
+    return record
+
+
+def build_coverage_summary(
+    folder: str | Path,
+    config: CoverageViewerConfig,
+    file: Optional[str] = None,
+    *,
+    results: dict[Path, CoverageImageResult] | None = None,
+    failures: list[dict] | None = None,
+) -> dict:
+    """Build a coverage summary, optionally reusing already analysed images.
+
+    ``results`` is used by the batch path so JSON, PNG and tables share the
+    single branch analysis rather than invoking the pipeline a second time.
+    """
     folder = Path(folder)
     image_paths = _resolve_image_paths(folder, file)
     images = []
-    failed_images = []
+    failed_images = list(failures or [])
     coverage_vals = []
     coverage_pct_vals = []
     projected_counts = []
     sphere_counts = []
     sphere_densities = []
     bead_diameters = []
+    primary_cap_coverages_pct: list[float] = []
+    radial_sd_values: list[float] = []
+    polar_sd_values: list[float] = []
+    sensitivity_values: list[float] = []
+    partition_deltas: list[float] = []
+    cap_metric_values_pct: dict[str, list[float]] = {metric: [] for metric in CAP_COVERAGE_METRICS}
+    domain_metric_values_pct: dict[str, list[float]] = {metric: [] for metric in CAP_COVERAGE_METRICS}
+    primary_domain_values_pct: list[float] = []
+    local_total_sd_values: list[float] = []
+    local_residual_sd_values: list[float] = []
+    local_delta_values: list[float] = []
+
+    def _between_roi_stats(values: list[float]) -> dict[str, float | int | None]:
+        if not values:
+            return {"count": 0, "mean_percent": None, "median_percent": None, "sd_pp": None, "sem_pp": None, "min_percent": None, "max_percent": None}
+        array = np.asarray(values, dtype=float)
+        sd = float(np.std(array, ddof=1)) if array.size >= 2 else None
+        return {
+            "count": int(array.size), "mean_percent": _safe_float(float(array.mean())),
+            "median_percent": _safe_float(float(np.median(array))), "sd_pp": _safe_float(sd),
+            "sem_pp": _safe_float(sd / math.sqrt(array.size)) if sd is not None else None,
+            "min_percent": _safe_float(float(array.min())), "max_percent": _safe_float(float(array.max())),
+        }
 
     for image_path in image_paths:
-        try:
-            res = analyze_coverage_image(image_path, config)
-        except Exception as exc:
-            failed_images.append(
-                {
-                    "file": image_path.name,
-                    "sample": image_path.parent.name,
-                    "error": str(exc),
-                }
-            )
-            continue
+        if results is not None:
+            res = results.get(image_path)
+            if res is None:
+                if not any(item.get("file") == image_path.name for item in failed_images):
+                    failed_images.append({"file": image_path.name, "sample": image_path.parent.name, "error": "No result available"})
+                continue
+        else:
+            try:
+                res = analyze_coverage_image(image_path, config)
+            except Exception as exc:
+                failed_images.append(
+                    {
+                        "file": image_path.name,
+                        "sample": image_path.parent.name,
+                        "error": str(exc),
+                    }
+                )
+                continue
         rois = []
         included_roi_count = 0
         for roi in res.roi_results:
             include_in_global = _include_roi_in_global_summary(roi, config)
+            inscribed = maximum_inscribed_circle(roi.bead_mask)
+            pixel_size_m = res.metadata.mean_pixel_size_m
             rois.append(
                 {
                     "roi_index": roi.roi_index,
@@ -1170,8 +1624,14 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "coverage_percent": _safe_float(roi.coverage_percent),
                     "legacy_full_projected_coverage_percent": _safe_float(roi.legacy_full_projected_coverage_percent),
                     "cap_projected_coverage_percent": _safe_float(roi.cap_projected_coverage_percent),
+                    "cap_projected_fraction": _safe_float(roi.cap_projected_coverage),
+                    "cap_projected_fraction_percent": _safe_float(roi.cap_projected_coverage_percent),
                     "cap_surface_weighted_coverage_percent": _safe_float(roi.cap_surface_weighted_coverage_percent),
+                    "cap_surface_weighted_fraction": _safe_float(roi.cap_surface_weighted_coverage),
+                    "cap_surface_weighted_fraction_percent": _safe_float(roi.cap_surface_weighted_coverage_percent),
                     "cap_projected_over_surface_coverage_percent": _safe_float(roi.cap_projected_over_surface_coverage_percent),
+                    "cap_projected_over_cap_surface": _safe_float(roi.cap_projected_over_surface_coverage),
+                    "cap_projected_over_cap_surface_percent": _safe_float(roi.cap_projected_over_surface_coverage_percent),
                     "selected_coverage_percent": _safe_float(roi.coverage_percent),
                     "selected_coverage_method": roi.selected_coverage_method,
                     "projected_ag_count": int(roi.projected_ag_count),
@@ -1183,6 +1643,10 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "bead_area_px": int(roi.bead_area_px),
                     "ag_area_px": int(roi.ag_area_px),
                     "bead_eq_diameter_m": _safe_float(roi.bead_metrics.equivalent_diameter_m),
+                    "diam_xy_mean_um": _safe_float(((roi.bead_metrics.x_diameter_m + roi.bead_metrics.y_diameter_m) / 2.0 * 1e6) if roi.bead_metrics.x_diameter_m is not None and roi.bead_metrics.y_diameter_m is not None else None),
+                    "diam_eq_um": _safe_float(roi.bead_metrics.equivalent_diameter_m * 1e6) if roi.bead_metrics.equivalent_diameter_m is not None else None,
+                    "diam_inscribed_um": _safe_float(2.0 * inscribed.radius_px * pixel_size_m * 1e6) if pixel_size_m is not None else None,
+                    "selected_sphere_diameter_um": _safe_float(roi.bead_metrics.sphere_diameter_m * 1e6) if roi.bead_metrics.sphere_diameter_m is not None else None,
                     "sphere_diameter_px": _safe_float(roi.bead_metrics.sphere_diameter_px),
                     "sphere_diameter_m": _safe_float(roi.bead_metrics.sphere_diameter_m),
                     "sphere_radius_px": _safe_float(roi.bead_metrics.sphere_radius_px),
@@ -1197,6 +1661,8 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "coverage_cap_radius_fraction": float(config.coverage_cap_radius_fraction),
                     "sphere_diameter_metric": config.sphere_diameter_metric,
                     "selected_cap_coverage_metric": config.selected_cap_coverage_metric,
+                    "primary_cap_coverage_fraction": _safe_float(roi.cap_metrics.selected_value(config.selected_cap_coverage_metric)) if roi.cap_metrics else None,
+                    "primary_cap_coverage_percent": _safe_float(roi.cap_metrics.selected_value(config.selected_cap_coverage_metric) * 100.0) if roi.cap_metrics and roi.cap_metrics.selected_value(config.selected_cap_coverage_metric) is not None else None,
                     "coverage_cap_projected_radius_px": _safe_float(roi.cap_metrics.geometry.cap_radius_px) if roi.cap_metrics else None,
                     "coverage_cap_projected_radius_m": _safe_float(roi.cap_metrics.cap_radius_m) if roi.cap_metrics else None,
                     "coverage_cap_half_angle_deg": _safe_float(roi.cap_metrics.geometry.half_angle_deg) if roi.cap_metrics else None,
@@ -1205,6 +1671,11 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                     "coverage_cap_surface_area_m2": _safe_float(roi.cap_metrics.surface_area_m2) if roi.cap_metrics else None,
                     "coverage_cap_completeness": _safe_float(roi.cap_metrics.geometry.completeness) if roi.cap_metrics else None,
                     "coverage_cap_valid": bool(roi.cap_metrics.valid) if roi.cap_metrics else False,
+                    "polar_rotation_samples": int(config.polar_rotation_samples),
+                    "polar_sector_count": int(config.polar_sector_count),
+                    **_cap_sensitivity_record(roi.cap_sensitivity, config.selected_cap_coverage_metric),
+                    **_homogeneity_record(roi.homogeneity, config.selected_cap_coverage_metric),
+                    **_local_heterogeneity_record(roi.local_heterogeneity, config.selected_cap_coverage_metric),
                 }
             )
             if not include_in_global:
@@ -1218,7 +1689,49 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                 sphere_densities.append(float(roi.sphere_np_density_per_um2))
             if roi.bead_metrics.equivalent_diameter_m is not None:
                 bead_diameters.append(float(roi.bead_metrics.equivalent_diameter_m))
+            if roi.cap_metrics and roi.cap_metrics.valid:
+                primary = roi.cap_metrics.selected_value(config.selected_cap_coverage_metric)
+                if primary is not None:
+                    primary_cap_coverages_pct.append(float(primary * 100.0))
+                for metric in CAP_COVERAGE_METRICS:
+                    value = roi.cap_metrics.selected_value(metric)
+                    if value is not None:
+                        cap_metric_values_pct[metric].append(float(value * 100.0))
+            if roi.local_heterogeneity and roi.local_heterogeneity.domain.valid:
+                local_result = roi.local_heterogeneity
+                selected_domain = local_result.domain.components(config.selected_cap_coverage_metric).value
+                if selected_domain is not None:
+                    primary_domain_values_pct.append(float(selected_domain * 100.0))
+                for metric in CAP_COVERAGE_METRICS:
+                    value = local_result.domain.components(metric).value
+                    if value is not None:
+                        domain_metric_values_pct[metric].append(float(value * 100.0))
+                selected_local = local_result.metrics[config.selected_cap_coverage_metric]
+                if selected_local.total_weighted_sd_pp is not None:
+                    local_total_sd_values.append(float(selected_local.total_weighted_sd_pp))
+                if selected_local.residual_weighted_sd_pp is not None:
+                    local_residual_sd_values.append(float(selected_local.residual_weighted_sd_pp))
+                if selected_local.reconstruction_delta_pp is not None:
+                    local_delta_values.append(float(selected_local.reconstruction_delta_pp))
+            hom_record = _homogeneity_record(roi.homogeneity, config.selected_cap_coverage_metric)
+            for source, target in (("radial_weighted_sd_pp", radial_sd_values), ("polar_rotation_sd_median_pp", polar_sd_values), ("radial_partition_delta_pp", partition_deltas), ("polar_partition_delta_pp", partition_deltas)):
+                value = hom_record.get(source)
+                if value is not None:
+                    target.append(float(value))
+            sensitivity = roi.cap_sensitivity.get(config.selected_cap_coverage_metric)
+            if sensitivity and sensitivity.q10_q90_half_width_pp is not None:
+                sensitivity_values.append(float(sensitivity.q10_q90_half_width_pp))
 
+        image_summary: dict[str, object] = {}
+        for prefix, key in (("primary_cap", "primary_cap_coverage_percent"), ("primary_homogeneity_domain", "primary_homogeneity_domain_coverage_percent")):
+            image_summary.update({f"{prefix}_{name}": value for name, value in _between_roi_stats([
+                float(roi[key]) for roi in rois if roi.get("included_in_global_summary") and roi.get(key) is not None and (prefix != "primary_homogeneity_domain" or roi.get("homogeneity_domain_valid"))
+            ]).items()})
+        for metric in CAP_COVERAGE_METRICS:
+            for prefix, key in (("cap", f"cap_{metric}_percent"), ("homogeneity_domain", f"homogeneity_domain_{metric}_percent")):
+                image_summary.update({f"{prefix}_{metric}_{name}": value for name, value in _between_roi_stats([
+                    float(roi[key]) for roi in rois if roi.get("included_in_global_summary") and roi.get(key) is not None and (prefix != "homogeneity_domain" or roi.get("homogeneity_domain_valid"))
+                ]).items()})
         images.append(
             {
                 "file": image_path.name,
@@ -1230,6 +1743,8 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
                 "pixel_size_m": _safe_float(res.metadata.mean_pixel_size_m),
                 "roi_count": len(rois),
                 "included_roi_count": included_roi_count,
+                "excluded_roi_count": len(rois) - included_roi_count,
+                "image_summary": image_summary,
                 "rois": rois,
             }
         )
@@ -1242,6 +1757,9 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
 
     def _median(values: list[float]) -> Optional[float]:
         return _safe_float(float(np.median(values))) if values else None
+
+    def _sem(values: list[float]) -> Optional[float]:
+        return _safe_float(float(np.std(values, ddof=1) / math.sqrt(len(values)))) if len(values) >= 2 else None
 
     return {
         "folder": str(folder),
@@ -1270,7 +1788,247 @@ def build_coverage_summary(folder: str | Path, config: CoverageViewerConfig, fil
             "sd_sphere_np_density_per_um2": _std(sphere_densities),
             "mean_bead_eq_diameter_m": _mean(bead_diameters),
             "sd_bead_eq_diameter_m": _std(bead_diameters),
+            "selected_cap_coverage_metric": config.selected_cap_coverage_metric,
+            "coverage_cap_radius_fraction": float(config.coverage_cap_radius_fraction),
+            "primary_cap_coverage_count": len(primary_cap_coverages_pct),
+            "primary_cap_coverage_mean_percent": _mean(primary_cap_coverages_pct),
+            "primary_cap_coverage_median_percent": _median(primary_cap_coverages_pct),
+            "primary_cap_coverage_sd_pp": _std(primary_cap_coverages_pct),
+            "primary_cap_coverage_sem_pp": _sem(primary_cap_coverages_pct),
+            "primary_cap_coverage_min_percent": _safe_float(min(primary_cap_coverages_pct)) if primary_cap_coverages_pct else None,
+            "primary_cap_coverage_max_percent": _safe_float(max(primary_cap_coverages_pct)) if primary_cap_coverages_pct else None,
+            "primary_homogeneity_domain_coverage_count": len(primary_domain_values_pct),
+            "primary_homogeneity_domain_coverage_mean_percent": _mean(primary_domain_values_pct),
+            "primary_homogeneity_domain_coverage_median_percent": _median(primary_domain_values_pct),
+            "primary_homogeneity_domain_coverage_sd_pp": _std(primary_domain_values_pct),
+            "primary_homogeneity_domain_coverage_sem_pp": _sem(primary_domain_values_pct),
+            "primary_homogeneity_domain_coverage_min_percent": _safe_float(min(primary_domain_values_pct)) if primary_domain_values_pct else None,
+            "primary_homogeneity_domain_coverage_max_percent": _safe_float(max(primary_domain_values_pct)) if primary_domain_values_pct else None,
+            "local_total_heterogeneity_mean_sd_pp": _mean(local_total_sd_values),
+            "local_residual_heterogeneity_mean_sd_pp": _mean(local_residual_sd_values),
+            "local_grid_reconstruction_delta_mean_pp": _mean(local_delta_values),
+            "radial_homogeneity_count": len(radial_sd_values),
+            "radial_homogeneity_mean_sd_pp": _mean(radial_sd_values),
+            "radial_homogeneity_median_sd_pp": _median(radial_sd_values),
+            "radial_homogeneity_sd_of_sd_pp": _std(radial_sd_values),
+            "polar_homogeneity_count": len(polar_sd_values),
+            "polar_homogeneity_mean_sd_pp": _mean(polar_sd_values),
+            "polar_homogeneity_median_sd_pp": _median(polar_sd_values),
+            "polar_homogeneity_sd_of_sd_pp": _std(polar_sd_values),
+            "cap_radius_sensitivity_median_pp": _median(sensitivity_values),
+            "cap_radius_sensitivity_max_pp": _safe_float(max(sensitivity_values)) if sensitivity_values else None,
+            "partition_qc_max_delta_pp": _safe_float(max(partition_deltas)) if partition_deltas else None,
+            "projected_fraction_coverage_count": len(cap_metric_values_pct["projected_fraction"]),
+            "projected_fraction_coverage_mean_percent": _mean(cap_metric_values_pct["projected_fraction"]),
+            "projected_fraction_coverage_median_percent": _median(cap_metric_values_pct["projected_fraction"]),
+            "projected_fraction_coverage_sd_pp": _std(cap_metric_values_pct["projected_fraction"]),
+            "surface_weighted_fraction_coverage_count": len(cap_metric_values_pct["surface_weighted_fraction"]),
+            "surface_weighted_fraction_coverage_mean_percent": _mean(cap_metric_values_pct["surface_weighted_fraction"]),
+            "surface_weighted_fraction_coverage_median_percent": _median(cap_metric_values_pct["surface_weighted_fraction"]),
+            "surface_weighted_fraction_coverage_sd_pp": _std(cap_metric_values_pct["surface_weighted_fraction"]),
+            "projected_over_cap_surface_coverage_count": len(cap_metric_values_pct["projected_over_cap_surface"]),
+            "projected_over_cap_surface_coverage_mean_percent": _mean(cap_metric_values_pct["projected_over_cap_surface"]),
+            "projected_over_cap_surface_coverage_median_percent": _median(cap_metric_values_pct["projected_over_cap_surface"]),
+            "projected_over_cap_surface_coverage_sd_pp": _std(cap_metric_values_pct["projected_over_cap_surface"]),
+            **{
+                f"homogeneity_domain_{metric}_coverage_{name}": value
+                for metric, values in domain_metric_values_pct.items()
+                for name, value in {
+                    "count": len(values), "mean_percent": _mean(values), "median_percent": _median(values),
+                    "sd_pp": _std(values), "sem_pp": _sem(values),
+                    "min_percent": _safe_float(min(values)) if values else None,
+                    "max_percent": _safe_float(max(values)) if values else None,
+                }.items()
+            },
         },
+        "images": images,
+        "failed_images": failed_images,
+    }
+
+
+def build_coverage_image_record(
+    image_path: str | Path,
+    config: CoverageViewerConfig,
+    result: CoverageImageResult,
+) -> dict[str, object]:
+    """Serialize one already-analysed image without retaining its arrays.
+
+    This deliberately reuses the established summary serializer so the
+    streaming batch path cannot drift from interactive/single-image JSON
+    output.  The singleton ``results`` mapping exists only for this call and
+    is discarded before the next image is analysed.
+    """
+
+    path = Path(image_path)
+    summary = build_coverage_summary(
+        path.parent,
+        config,
+        file=path.name,
+        results={path: result},
+    )
+    images = summary.get("images", [])
+    if len(images) != 1:
+        raise RuntimeError(f"Could not serialize coverage result for '{path}'.")
+    return images[0]
+
+
+def _serializable_roi_values(
+    images: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        roi
+        for image in images
+        for roi in image.get("rois", [])
+        if isinstance(roi, dict) and roi.get("included_in_global_summary")
+    ]
+
+
+def build_coverage_summary_from_records(
+    folder: str | Path,
+    config: CoverageViewerConfig,
+    *,
+    image_paths: list[Path] | tuple[Path, ...],
+    image_records: list[dict[str, object]] | tuple[dict[str, object], ...],
+    failures: list[dict] | tuple[dict, ...] = (),
+    file: Optional[str] = None,
+) -> dict:
+    """Finalize one sample from lightweight JSON-compatible image records.
+
+    Sample statistics are computed from the retained ROI records themselves,
+    not by averaging the image summaries.  Consequently the streaming batch
+    has the same between-bead statistical unit as :func:`build_coverage_summary`
+    while no :class:`CoverageImageResult` needs to survive finalization.
+    """
+
+    folder = Path(folder)
+    images = list(image_records)
+    failed_images = list(failures)
+    included_rois = _serializable_roi_values(images)
+
+    def values(key: str, *, predicate=lambda _roi: True) -> list[float]:
+        output: list[float] = []
+        for roi in included_rois:
+            value = roi.get(key)
+            if value is not None and predicate(roi):
+                output.append(float(value))
+        return output
+
+    def mean(items: list[float]) -> Optional[float]:
+        return _safe_float(float(np.mean(items))) if items else None
+
+    def std(items: list[float]) -> Optional[float]:
+        return _safe_float(float(np.std(items, ddof=1))) if len(items) >= 2 else None
+
+    def median(items: list[float]) -> Optional[float]:
+        return _safe_float(float(np.median(items))) if items else None
+
+    def sem(items: list[float]) -> Optional[float]:
+        return _safe_float(float(np.std(items, ddof=1) / math.sqrt(len(items)))) if len(items) >= 2 else None
+
+    cap_valid = lambda roi: bool(roi.get("coverage_cap_valid"))
+    domain_valid = lambda roi: bool(roi.get("homogeneity_domain_valid"))
+    coverage_vals = values("coverage")
+    coverage_pct_vals = values("coverage_percent")
+    projected_counts = values("projected_ag_count")
+    sphere_counts = values("sphere_ag_count_est")
+    sphere_densities = values("sphere_np_density_per_um2")
+    bead_diameters = values("bead_eq_diameter_m")
+    primary_cap_coverages_pct = values("primary_cap_coverage_percent", predicate=cap_valid)
+    primary_domain_values_pct = values("primary_homogeneity_domain_coverage_percent", predicate=domain_valid)
+    local_total_sd_values = values("local_total_weighted_sd_pp", predicate=domain_valid)
+    local_residual_sd_values = values("local_residual_weighted_sd_pp", predicate=domain_valid)
+    local_delta_values = values("primary_local_grid_reconstruction_delta_pp", predicate=domain_valid)
+    radial_sd_values = values("radial_weighted_sd_pp")
+    polar_sd_values = values("polar_rotation_sd_median_pp")
+    sensitivity_values = values("primary_cap_radius_sensitivity_q10_q90_half_width_pp")
+    partition_deltas = values("radial_partition_delta_pp") + values("polar_partition_delta_pp")
+    cap_metric_values_pct = {
+        metric: values(f"cap_{metric}_percent", predicate=cap_valid)
+        for metric in CAP_COVERAGE_METRICS
+    }
+    domain_metric_values_pct = {
+        metric: values(f"homogeneity_domain_{metric}_percent", predicate=domain_valid)
+        for metric in CAP_COVERAGE_METRICS
+    }
+
+    global_summary: dict[str, object] = {
+        "image_count": len(images),
+        "failed_image_count": len(failed_images),
+        "input_image_count": len(image_paths),
+        "total_roi_count": sum(int(image.get("roi_count", 0)) for image in images),
+        "included_roi_count": sum(int(image.get("included_roi_count", 0)) for image in images),
+        "sphere_anisotropy_check": bool(config.sphere_anisotropy_check),
+        "max_global_sphere_anisotropy_ratio": float(config.max_global_sphere_anisotropy_ratio),
+        "sphere_solidity_check": bool(config.sphere_solidity_check),
+        "min_global_sphere_solidity": float(config.min_global_sphere_solidity),
+        "mean_coverage": mean(coverage_vals),
+        "sd_coverage": std(coverage_vals),
+        "mean_coverage_percent": mean(coverage_pct_vals),
+        "sd_coverage_percent": std(coverage_pct_vals),
+        "median_coverage_percent": median(coverage_pct_vals),
+        "mean_projected_ag_count": mean(projected_counts),
+        "sd_projected_ag_count": std(projected_counts),
+        "mean_sphere_ag_count_est": mean(sphere_counts),
+        "sd_sphere_ag_count_est": std(sphere_counts),
+        "mean_sphere_np_density_per_um2": mean(sphere_densities),
+        "sd_sphere_np_density_per_um2": std(sphere_densities),
+        "mean_bead_eq_diameter_m": mean(bead_diameters),
+        "sd_bead_eq_diameter_m": std(bead_diameters),
+        "selected_cap_coverage_metric": config.selected_cap_coverage_metric,
+        "coverage_cap_radius_fraction": float(config.coverage_cap_radius_fraction),
+        "primary_cap_coverage_count": len(primary_cap_coverages_pct),
+        "primary_cap_coverage_mean_percent": mean(primary_cap_coverages_pct),
+        "primary_cap_coverage_median_percent": median(primary_cap_coverages_pct),
+        "primary_cap_coverage_sd_pp": std(primary_cap_coverages_pct),
+        "primary_cap_coverage_sem_pp": sem(primary_cap_coverages_pct),
+        "primary_cap_coverage_min_percent": _safe_float(min(primary_cap_coverages_pct)) if primary_cap_coverages_pct else None,
+        "primary_cap_coverage_max_percent": _safe_float(max(primary_cap_coverages_pct)) if primary_cap_coverages_pct else None,
+        "primary_homogeneity_domain_coverage_count": len(primary_domain_values_pct),
+        "primary_homogeneity_domain_coverage_mean_percent": mean(primary_domain_values_pct),
+        "primary_homogeneity_domain_coverage_median_percent": median(primary_domain_values_pct),
+        "primary_homogeneity_domain_coverage_sd_pp": std(primary_domain_values_pct),
+        "primary_homogeneity_domain_coverage_sem_pp": sem(primary_domain_values_pct),
+        "primary_homogeneity_domain_coverage_min_percent": _safe_float(min(primary_domain_values_pct)) if primary_domain_values_pct else None,
+        "primary_homogeneity_domain_coverage_max_percent": _safe_float(max(primary_domain_values_pct)) if primary_domain_values_pct else None,
+        "local_total_heterogeneity_mean_sd_pp": mean(local_total_sd_values),
+        "local_residual_heterogeneity_mean_sd_pp": mean(local_residual_sd_values),
+        "local_grid_reconstruction_delta_mean_pp": mean(local_delta_values),
+        "radial_homogeneity_count": len(radial_sd_values),
+        "radial_homogeneity_mean_sd_pp": mean(radial_sd_values),
+        "radial_homogeneity_median_sd_pp": median(radial_sd_values),
+        "radial_homogeneity_sd_of_sd_pp": std(radial_sd_values),
+        "polar_homogeneity_count": len(polar_sd_values),
+        "polar_homogeneity_mean_sd_pp": mean(polar_sd_values),
+        "polar_homogeneity_median_sd_pp": median(polar_sd_values),
+        "polar_homogeneity_sd_of_sd_pp": std(polar_sd_values),
+        "cap_radius_sensitivity_median_pp": median(sensitivity_values),
+        "cap_radius_sensitivity_max_pp": _safe_float(max(sensitivity_values)) if sensitivity_values else None,
+        "partition_qc_max_delta_pp": _safe_float(max(partition_deltas)) if partition_deltas else None,
+    }
+    for metric in CAP_COVERAGE_METRICS:
+        cap_values = cap_metric_values_pct[metric]
+        global_summary.update({
+            f"{metric}_coverage_count": len(cap_values),
+            f"{metric}_coverage_mean_percent": mean(cap_values),
+            f"{metric}_coverage_median_percent": median(cap_values),
+            f"{metric}_coverage_sd_pp": std(cap_values),
+        })
+        domain_values = domain_metric_values_pct[metric]
+        global_summary.update({
+            f"homogeneity_domain_{metric}_coverage_count": len(domain_values),
+            f"homogeneity_domain_{metric}_coverage_mean_percent": mean(domain_values),
+            f"homogeneity_domain_{metric}_coverage_median_percent": median(domain_values),
+            f"homogeneity_domain_{metric}_coverage_sd_pp": std(domain_values),
+            f"homogeneity_domain_{metric}_coverage_sem_pp": sem(domain_values),
+            f"homogeneity_domain_{metric}_coverage_min_percent": _safe_float(min(domain_values)) if domain_values else None,
+            f"homogeneity_domain_{metric}_coverage_max_percent": _safe_float(max(domain_values)) if domain_values else None,
+        })
+
+    return {
+        "folder": str(folder),
+        "file": file,
+        "viewer_config": asdict(config),
+        "global_summary": global_summary,
         "images": images,
         "failed_images": failed_images,
     }

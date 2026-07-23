@@ -8,7 +8,7 @@ Only the SEM bead adapter is implemented at present.
 from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 import json
@@ -16,7 +16,7 @@ import logging
 import math
 from pathlib import Path
 from queue import Empty, Queue
-from threading import RLock
+from threading import RLock, Thread
 from time import perf_counter
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
@@ -36,6 +36,7 @@ from matplotlib.widgets import (
     Slider,
     TextBox,
 )
+from matplotlib.patches import Circle, Wedge
 import numpy as np
 from skimage.segmentation import find_boundaries
 from tifffile import imread
@@ -67,7 +68,6 @@ from sem_coverage_viewer import (
     _nice_scale_length_m as _nice_coverage_scale_length_m,
     _paired_hdr_path,
     _read_hdr_metadata,
-    _resolve_image_paths,
     analyze_coverage_image,
     load_app_config as load_coverage_app_config,
     load_failed_image_preview,
@@ -78,12 +78,28 @@ from coverage_cap import (
     cumulative_cap_sweep,
     normalize_cap_coverage_metric,
     normalize_sphere_diameter_metric,
-    sphere_diameter_px as _cap_sphere_diameter_px,
+    sphere_geometry_from_mask,
+    maximum_inscribed_circle,
 )
 from coverage_homogeneity import compute_homogeneity
+from coverage_local_heterogeneity import (
+    aggregate_local_rotation_results,
+    compute_local_grid_at_rotation,
+    compute_local_heterogeneity,
+    compute_local_rotation_series,
+    local_grid_index_maps,
+    local_grid_indices,
+)
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer
+from path_utils import discover_images_recursive, path_to_config_text, resolve_optional_file_in_folder
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _coverage_branch_label(config: CoverageViewerConfig) -> str:
+    """Describe the existing coverage-mask branch without changing its logic."""
+
+    return "secondary coverage branch" if config.ag_enable_secondary_coverage else "primary-only coverage"
 
 ParameterKind = Literal["float", "int", "bool", "range", "text", "choice"]
 ActivityPredicate = Callable[[Any], tuple[bool, str] | bool]
@@ -706,10 +722,13 @@ class BeadsDiagnosticAdapter:
             raise FileNotFoundError(f"Image folder does not exist: '{folder}'.")
         if not folder.is_dir():
             raise NotADirectoryError(f"Image folder is not a directory: '{folder}'.")
-        paths = sorted(folder.glob("*.tif"))
-        if not paths:
-            raise FileNotFoundError(f"No lowercase .tif files found in '{folder}'.")
-        return paths
+        file_choice = selected_file if selected_file is not None else app_config.file
+        if file_choice:
+            selected = resolve_optional_file_in_folder(folder, file_choice, description="selected image")
+            if selected is None or not selected.is_file():
+                raise FileNotFoundError(f"Selected image is not a file: '{file_choice}'.")
+            return [selected.resolve()]
+        return discover_images_recursive(folder)
 
     def analyze(self, image_path: Path, config: ViewerConfig) -> BeadAnalysisResult:
         return analyze_bead_image(image_path, config=config)
@@ -1119,7 +1138,8 @@ class CoverageDiagnosticAdapter:
     mode_name = "coverage"
     overlay_stage = "overlay"
     measurement_line_label = "Diameter lines"
-    measurement_text_label = "Diameter labels"
+    # Coverage intentionally uses one control for lines and their values.
+    measurement_text_label = "Diameter lines"
     scale_bar_label = "Scale bar"
     supports_roi_selection = True
     inactive_fields: tuple[str, ...] = ()
@@ -1151,6 +1171,34 @@ class CoverageDiagnosticAdapter:
     def __init__(self) -> None:
         self._cap_graph_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._homogeneity_cache: dict[tuple[Any, ...], Any] = {}
+        self._local_heterogeneity_cache: dict[tuple[Any, ...], Any] = {}
+        self._local_heterogeneity_robust_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+        self._local_heterogeneity_cache_result: Any | None = None
+        self._inscribed_circle_cache: dict[int, Any] = {}
+
+    def _scope_local_heterogeneity_caches(self, result: Any) -> None:
+        """Keep local-grid caches bounded to the most recently used image."""
+
+        if result is self._local_heterogeneity_cache_result:
+            return
+        self._local_heterogeneity_cache.clear()
+        self._local_heterogeneity_robust_cache.clear()
+        self._local_heterogeneity_cache_result = result
+
+    @staticmethod
+    def _put_bounded_local_cache(
+        cache: dict[tuple[Any, ...], Any],
+        key: tuple[Any, ...],
+        value: Any,
+        *,
+        limit: int = 64,
+    ) -> None:
+        """Insert one active-image cache entry without unbounded growth."""
+
+        cache.pop(key, None)
+        cache[key] = value
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
 
     @staticmethod
     def _effective_config(
@@ -1752,6 +1800,15 @@ class CoverageDiagnosticAdapter:
                 active_when=_global_solidity_active,
             ),
         ),
+        "Sphere geometry": (
+            _spec(
+                "sphere_diameter_metric", "Sphere geometry", "Sphere geometry", "choice",
+                None, None, None,
+                "Mean X/Y and equivalent diameter use the bead-mask centroid. Maximum inscribed circle uses its own center and radius. The selected geometry is reused by cap, legacy homogeneity, and local heterogeneity.",
+                requires_analysis=False,
+                choices=(("mean_xy_diameter", "Mean X/Y diameter"), ("equivalent_diameter", "Equivalent diameter"), ("max_inscribed_circle", "Maximum inscribed circle")),
+            ),
+        ),
         "Coverage cap": (
             _spec(
                 "coverage_cap_enabled", "Enable central coverage cap", "Coverage cap", "bool",
@@ -1770,16 +1827,6 @@ class CoverageDiagnosticAdapter:
                 0.0, 1.0, 0.01,
                 "Minimum retained fraction of the theoretical cap circle. Increase to reject caps clipped by an incomplete bead mask.",
                 requires_analysis=False,
-            ),
-            _spec(
-                "sphere_diameter_metric", "Sphere diameter metric", "Coverage cap", "choice",
-                None, None, None,
-                "Selects the diameter used only for cap and sphere geometry. Mean X/Y is (d_x + d_y)/2; equivalent diameter is 2*sqrt(A/pi).",
-                requires_analysis=False,
-                choices=(
-                    ("mean_xy_diameter", "Mean X/Y diameter"),
-                    ("equivalent_diameter", "Equivalent diameter"),
-                ),
             ),
             _spec(
                 "selected_cap_coverage_metric", "Selected cap coverage metric", "Coverage cap", "choice",
@@ -1802,15 +1849,33 @@ class CoverageDiagnosticAdapter:
                     ("annular", "Annular"),
                 ),
             ),
+            _spec("coverage_cap_annulus_width_fraction", "Annulus width fraction", "Coverage cap", "float", 0.01, 0.5, 0.01, "Sets constant non-overlapping annulus width as a fraction of estimated sphere radius.", requires_analysis=False, active_when=lambda c: (c.coverage_cap_graph_mode == "annular", "Inactive unless graph mode is Annular.")),
+            _spec("coverage_cap_sensitivity_enabled", "Enable radius sensitivity", "Coverage cap", "bool", None, None, None, "Calculates cap-radius selection sensitivity from existing masks.", requires_analysis=False),
+            _spec("coverage_cap_sensitivity_half_width", "Sensitivity half width", "Coverage cap", "float", 0.0, 0.5, 0.01, "Half-width of the cap-radius sensitivity interval around the configured cap fraction.", requires_analysis=False),
+            _spec("coverage_cap_sensitivity_step_fraction", "Sensitivity step", "Coverage cap", "float", 0.005, 0.2, 0.005, "Fraction step used for cap-radius sensitivity points.", requires_analysis=False),
         ),
-        "Coverage homogeneity": (
-            _spec("coverage_homogeneity_enabled", "Enable coverage homogeneity", "Coverage homogeneity", "bool", None, None, None, "Enables lightweight ring and sector homogeneity analysis.", requires_analysis=False),
-            _spec("homogeneity_inner_radius_fraction", "Inner radius fraction", "Coverage homogeneity", "float", 0.0, 0.95, 0.01, "Inner analyzed radius in units of R.", requires_analysis=False),
-            _spec("homogeneity_outer_radius_fraction", "Outer radius fraction", "Coverage homogeneity", "float", 0.05, 1.0, 0.01, "Outer analyzed radius in units of R.", requires_analysis=False),
-            _spec("radial_ring_width_fraction", "Radial ring width", "Coverage homogeneity", "float", 0.01, 0.5, 0.01, "Constant non-overlapping ring width in units of R.", requires_analysis=False),
-            _spec("polar_sector_count", "Polar sector count", "Coverage homogeneity", "int", 2, 36, 1, "Equal angular sectors over the configured annulus.", requires_analysis=False),
-            _spec("homogeneity_min_segment_completeness", "Minimum segment completeness", "Coverage homogeneity", "float", 0.0, 1.0, 0.01, "Minimum retained reference fraction for a valid ring or sector.", requires_analysis=False),
-            _spec("homogeneity_view_mode", "Homogeneity view", "Coverage homogeneity", "choice", None, None, None, "Select radial rings or polar annular sectors.", requires_analysis=False, choices=(("radial", "Radial"), ("polar", "Polar"))),
+        "Coverage homogeneity (legacy)": (
+            _spec("coverage_homogeneity_enabled", "Enable legacy homogeneity", "Coverage homogeneity (legacy)", "bool", None, None, None, "Enables the established separate ring and sector homogeneity workflow.", requires_analysis=False),
+            _spec("homogeneity_inner_radius_fraction", "Inner radius fraction", "Coverage homogeneity (legacy)", "float", 0.0, 0.95, 0.01, "Inner analyzed radius in units of R.", requires_analysis=False),
+            _spec("homogeneity_outer_radius_fraction", "Outer radius fraction", "Coverage homogeneity (legacy)", "float", 0.05, 1.0, 0.01, "Outer analyzed radius in units of R.", requires_analysis=False),
+            _spec("radial_ring_width_fraction", "Radial ring width", "Coverage homogeneity (legacy)", "float", 0.01, 0.5, 0.01, "Constant non-overlapping ring width in units of R.", requires_analysis=False),
+            _spec("polar_sector_count", "Polar sector count", "Coverage homogeneity (legacy)", "int", 2, 36, 1, "Equal angular sectors over the configured annulus.", requires_analysis=False),
+            _spec("homogeneity_min_segment_completeness", "Minimum segment completeness", "Coverage homogeneity (legacy)", "float", 0.0, 1.0, 0.01, "Minimum retained reference fraction for a valid ring or sector.", requires_analysis=False),
+            _spec("homogeneity_view_mode", "Homogeneity view", "Coverage homogeneity (legacy)", "choice", None, None, None, "Select radial rings or polar annular sectors.", requires_analysis=False, choices=(("radial", "Radial"), ("polar", "Polar"))),
+            _spec("polar_rotation_samples", "Polar rotation samples", "Coverage homogeneity (legacy)", "int", 1, 36, 1, "Number of grid rotations used for robust production polar heterogeneity.", requires_analysis=False),
+            _spec("polar_display_rotation_deg", "Polar display rotation [deg]", "Coverage homogeneity (legacy)", "float", -180.0, 180.0, 1.0, "Display-only sector-grid orientation; it does not change rotation-robust production statistics.", requires_analysis=False),
+        ),
+        "Coverage local heterogeneity": (
+            _spec("local_heterogeneity_enabled", "Enable local grid", "Coverage local heterogeneity", "bool", None, None, None, "Enables a shared radial-band by polar-sector local coverage grid.", requires_analysis=False),
+            _spec("local_heterogeneity_inner_radius_fraction", "Inner radius fraction", "Coverage local heterogeneity", "float", 0.0, 0.95, 0.01, "Inner normalized radius of the local polar grid.", requires_analysis=False),
+            _spec("local_heterogeneity_outer_radius_fraction", "Outer radius fraction", "Coverage local heterogeneity", "float", 0.05, 1.0, 0.01, "Outer normalized radius of the local polar grid.", requires_analysis=False),
+            _spec("local_heterogeneity_radial_band_count", "Radial band count", "Coverage local heterogeneity", "int", 1, 24, 1, "Number of non-overlapping radial bands in the local grid.", requires_analysis=False),
+            _spec("local_heterogeneity_polar_sector_count", "Polar sector count", "Coverage local heterogeneity", "int", 2, 48, 1, "Number of non-overlapping angular sectors in the local grid.", requires_analysis=False),
+            _spec("local_heterogeneity_polar_rotation_samples", "Polar rotation samples", "Coverage local heterogeneity", "int", 1, 36, 1, "Robust local-grid rotations across one sector width.", requires_analysis=False),
+            _spec("local_heterogeneity_display_rotation_deg", "Display rotation [deg]", "Coverage local heterogeneity", "float", 0.0, 360.0, 1.0, "Display-only local sector orientation; it does not change robust rotation summaries.", requires_analysis=False),
+            _spec("local_heterogeneity_min_segment_completeness", "Minimum cell completeness", "Coverage local heterogeneity", "float", 0.0, 1.0, 0.01, "Minimum retained reference fraction for a local grid cell.", requires_analysis=False),
+            _spec("local_heterogeneity_show_heatmap", "Show 2D heatmap", "Coverage local heterogeneity", "bool", None, None, None, "Display the shared local-grid heatmap in the graph window.", requires_analysis=False),
+            _spec("local_heterogeneity_show_1d_profiles", "Show 1D profiles", "Coverage local heterogeneity", "bool", None, None, None, "Display radial and polar profiles derived from the same local grid.", requires_analysis=False),
         ),
     }
 
@@ -1843,15 +1908,17 @@ class CoverageDiagnosticAdapter:
             raise FileNotFoundError(f"Image folder does not exist: '{folder}'.")
         if not folder.is_dir():
             raise NotADirectoryError(f"Image folder is not a directory: '{folder}'.")
-        file_choice: str | None = None
+        file_choice: str | Path | None = None
         if selected_file is not None:
             file_choice = str(selected_file)
         elif app_config.file:
             file_choice = app_config.file
-        paths = _resolve_image_paths(folder, file_choice)
-        if not paths:
-            raise FileNotFoundError(f"No lowercase .tif files found in '{folder}'.")
-        return paths
+        if file_choice:
+            selected = resolve_optional_file_in_folder(folder, file_choice, description="selected image")
+            if selected is None or not selected.is_file():
+                raise FileNotFoundError(f"Selected image is not a file: '{file_choice}'.")
+            return [selected.resolve()]
+        return discover_images_recursive(folder)
 
     def analyze(
         self, image_path: Path, config: CoverageViewerConfig
@@ -1996,6 +2063,12 @@ class CoverageDiagnosticAdapter:
             return str(exc)
         if config.coverage_cap_graph_mode not in {"cumulative", "annular"}:
             return "Coverage cap graph mode must be cumulative or annular."
+        if not 0.0 < config.coverage_cap_annulus_width_fraction <= 1.0:
+            return "Coverage cap annulus width must satisfy 0 < width <= 1."
+        if not 0.0 <= config.coverage_cap_sensitivity_half_width < 1.0:
+            return "Cap sensitivity half width must satisfy 0 <= value < 1."
+        if not 0.0 < config.coverage_cap_sensitivity_step_fraction <= 1.0:
+            return "Cap sensitivity step must satisfy 0 < value <= 1."
         if not (0.0 <= config.homogeneity_inner_radius_fraction < config.homogeneity_outer_radius_fraction <= 1.0):
             return "Homogeneity radii must satisfy 0 <= inner < outer <= 1."
         if not (0.0 < config.radial_ring_width_fraction <= config.homogeneity_outer_radius_fraction - config.homogeneity_inner_radius_fraction):
@@ -2006,6 +2079,16 @@ class CoverageDiagnosticAdapter:
             return "Homogeneity segment completeness must be between 0 and 1."
         if config.homogeneity_view_mode not in {"radial", "polar"}:
             return "Homogeneity view mode must be radial or polar."
+        if not (0.0 <= config.local_heterogeneity_inner_radius_fraction < config.local_heterogeneity_outer_radius_fraction <= 1.0):
+            return "Local heterogeneity radii must satisfy 0 <= inner < outer <= 1."
+        if config.local_heterogeneity_radial_band_count < 1 or config.local_heterogeneity_polar_sector_count < 2:
+            return "Local heterogeneity requires at least one radial band and two polar sectors."
+        if not 0.0 <= config.local_heterogeneity_min_segment_completeness <= 1.0:
+            return "Local heterogeneity completeness must be between 0 and 1."
+        if config.local_heterogeneity_polar_rotation_samples < 1 or not np.isfinite(config.local_heterogeneity_display_rotation_deg):
+            return "Local heterogeneity rotation settings are invalid."
+        if config.polar_rotation_samples < 1 or not np.isfinite(config.polar_display_rotation_deg):
+            return "Polar rotation settings are invalid."
         if image_path is not None:
             hdr_path = _paired_hdr_path(Path(image_path))
             if hdr_path is not None:
@@ -2073,18 +2156,37 @@ class CoverageDiagnosticAdapter:
         return "excluded: " + ", ".join(reasons)
 
     @staticmethod
+    def _sphere_geometry(roi: BeadCoverageResult, config: CoverageViewerConfig):
+        """Resolve diagnostic cap geometry from an already accepted ROI mask."""
+
+        metrics = roi.bead_metrics
+        return sphere_geometry_from_mask(
+            roi.bead_mask,
+            centroid_rc=metrics.centroid_rc,
+            equivalent_diameter_px=metrics.equivalent_diameter_px,
+            x_diameter_px=metrics.x_diameter_px,
+            y_diameter_px=metrics.y_diameter_px,
+            metric=config.sphere_diameter_metric,
+        )
+
+    def inscribed_circle_geometry(self, roi: BeadCoverageResult):
+        """Cache the mask-only maximum circle for comparison overlays."""
+
+        key = id(roi.bead_mask)
+        geometry = self._inscribed_circle_cache.get(key)
+        if geometry is None:
+            geometry = maximum_inscribed_circle(roi.bead_mask)
+            self._inscribed_circle_cache[key] = geometry
+        return geometry
+
+    @staticmethod
     def _cap_for_roi(roi: BeadCoverageResult, config: CoverageViewerConfig, pixel_size_m: float | None):
         """Recompute only cap post-processing from the already accepted masks."""
 
-        radius = _cap_sphere_diameter_px(
-            roi.bead_metrics.equivalent_diameter_px,
-            roi.bead_metrics.x_diameter_px,
-            roi.bead_metrics.y_diameter_px,
-            config.sphere_diameter_metric,
-        ) / 2.0
+        geometry = CoverageDiagnosticAdapter._sphere_geometry(roi, config)
         return compute_coverage_cap_metrics(
-            roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc,
-            radius, config.coverage_cap_radius_fraction,
+            roi.bead_mask, roi.ag_mask, geometry.center_rc,
+            geometry.radius_px, config.coverage_cap_radius_fraction,
             pixel_size_m,
             compute_surface_weighted=True,
             min_completeness=config.coverage_cap_min_completeness,
@@ -2115,17 +2217,16 @@ class CoverageDiagnosticAdapter:
         annular: list[list[dict[str, Any]]] = []
         legacy: list[float] = []
         for roi in selected:
-            radius = _cap_sphere_diameter_px(
-                roi.bead_metrics.equivalent_diameter_px, roi.bead_metrics.x_diameter_px,
-                roi.bead_metrics.y_diameter_px, config.sphere_diameter_metric,
-            ) / 2.0
+            geometry = self._sphere_geometry(roi, config)
+            radius = geometry.radius_px
             cumulative.append(cumulative_cap_sweep(
-                roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc, radius,
+                roi.bead_mask, roi.ag_mask, geometry.center_rc, radius,
                 fractions, result.metadata.mean_pixel_size_m,
                 min_completeness=config.coverage_cap_min_completeness,
             ))
             annular.append(annular_cap_profile(
-                roi.bead_mask, roi.ag_mask, roi.bead_metrics.centroid_rc, radius, bins=16
+                roi.bead_mask, roi.ag_mask, geometry.center_rc, radius,
+                width_fraction=config.coverage_cap_annulus_width_fraction
             ))
             legacy.append(float(roi.legacy_full_projected_coverage))
         metric_names = (
@@ -2157,19 +2258,86 @@ class CoverageDiagnosticAdapter:
         return cached
 
     def homogeneity_data(self, result: CoverageImageResult, roi_selection: int | None, config: CoverageViewerConfig):
-        """Return cached direct ring/sector analysis from existing masks."""
+        """Return shared production-compatible ring/sector post-processing."""
         rois = self._selected_rois(result, roi_selection)
         if roi_selection is None:
             rois = [roi for roi in rois if _include_roi_in_global_summary(roi, config)]
         output=[]
         for roi in rois:
-            radius=_cap_sphere_diameter_px(roi.bead_metrics.equivalent_diameter_px, roi.bead_metrics.x_diameter_px, roi.bead_metrics.y_diameter_px, config.sphere_diameter_metric)/2
-            key=(id(roi), config.sphere_diameter_metric, config.homogeneity_inner_radius_fraction, config.homogeneity_outer_radius_fraction, config.radial_ring_width_fraction, config.polar_sector_count, config.homogeneity_min_segment_completeness, config.selected_cap_coverage_metric)
+            if config == result.config and roi.homogeneity is not None:
+                output.append(roi.homogeneity)
+                continue
+            geometry=self._sphere_geometry(roi, config)
+            radius=geometry.radius_px
+            key=(id(roi), config.sphere_diameter_metric, config.homogeneity_inner_radius_fraction, config.homogeneity_outer_radius_fraction, config.radial_ring_width_fraction, config.polar_sector_count, config.homogeneity_min_segment_completeness, config.selected_cap_coverage_metric, config.polar_rotation_samples, config.polar_display_rotation_deg)
             item=self._homogeneity_cache.get(key)
             if item is None:
-                item=compute_homogeneity(roi.bead_mask,roi.ag_mask,roi.bead_metrics.centroid_rc,radius,inner=config.homogeneity_inner_radius_fraction,outer=config.homogeneity_outer_radius_fraction,width=config.radial_ring_width_fraction,sectors=config.polar_sector_count,min_completeness=config.homogeneity_min_segment_completeness,metric=config.selected_cap_coverage_metric)
+                item=compute_homogeneity(roi.bead_mask,roi.ag_mask,geometry.center_rc,radius,inner=config.homogeneity_inner_radius_fraction,outer=config.homogeneity_outer_radius_fraction,width=config.radial_ring_width_fraction,sectors=config.polar_sector_count,min_completeness=config.homogeneity_min_segment_completeness,metric=config.selected_cap_coverage_metric,polar_rotation_samples=config.polar_rotation_samples,polar_display_rotation_deg=config.polar_display_rotation_deg)
                 self._homogeneity_cache[key]=item
             output.append(item)
+        return output
+
+    def local_heterogeneity_data(
+        self, result: CoverageImageResult, roi_selection: int | None, config: CoverageViewerConfig
+    ) -> list[Any]:
+        """Return cached joint local grids from existing ROI masks only."""
+
+        self._scope_local_heterogeneity_caches(result)
+        rois = self._selected_rois(result, roi_selection)
+        if roi_selection is None:
+            rois = [roi for roi in rois if _include_roi_in_global_summary(roi, config)]
+        output: list[Any] = []
+        for roi in rois:
+            geometry = self._sphere_geometry(roi, config)
+            base_key = (
+                id(roi), geometry.center_rc, geometry.radius_px,
+                config.local_heterogeneity_inner_radius_fraction,
+                config.local_heterogeneity_outer_radius_fraction,
+                config.local_heterogeneity_radial_band_count,
+                config.local_heterogeneity_polar_sector_count,
+                config.local_heterogeneity_min_segment_completeness,
+            )
+            key = base_key + (float(config.local_heterogeneity_display_rotation_deg) % 360.0,)
+            item = self._local_heterogeneity_cache.get(key)
+            if item is None:
+                # The display grid and orientation-robust series are separate:
+                # rotating the visible grid does not repeat robust rotations.
+                item = compute_local_grid_at_rotation(
+                    roi.bead_mask, roi.ag_mask, geometry.center_rc, geometry.radius_px,
+                    inner_fraction=config.local_heterogeneity_inner_radius_fraction,
+                    outer_fraction=config.local_heterogeneity_outer_radius_fraction,
+                    radial_band_count=config.local_heterogeneity_radial_band_count,
+                    polar_sector_count=config.local_heterogeneity_polar_sector_count,
+                    min_segment_completeness=config.local_heterogeneity_min_segment_completeness,
+                    metric=config.selected_cap_coverage_metric,
+                    rotation_offset_deg=config.local_heterogeneity_display_rotation_deg,
+                )
+                robust_key = base_key + (config.local_heterogeneity_polar_rotation_samples,)
+                robust = self._local_heterogeneity_robust_cache.get(robust_key)
+                if robust is None:
+                    rotations = compute_local_rotation_series(
+                        roi.bead_mask, roi.ag_mask, geometry.center_rc, geometry.radius_px,
+                        inner_fraction=config.local_heterogeneity_inner_radius_fraction,
+                        outer_fraction=config.local_heterogeneity_outer_radius_fraction,
+                        radial_band_count=config.local_heterogeneity_radial_band_count,
+                        polar_sector_count=config.local_heterogeneity_polar_sector_count,
+                        min_segment_completeness=config.local_heterogeneity_min_segment_completeness,
+                        metric=config.selected_cap_coverage_metric,
+                        polar_rotation_samples=config.local_heterogeneity_polar_rotation_samples,
+                    )
+                    robust = (rotations, aggregate_local_rotation_results(rotations))
+                    self._put_bounded_local_cache(
+                        self._local_heterogeneity_robust_cache,
+                        robust_key,
+                        robust,
+                    )
+                item = replace(item, polar_rotation_samples=config.local_heterogeneity_polar_rotation_samples, rotation_results=robust[0], rotation_aggregates=robust[1])
+                self._put_bounded_local_cache(
+                    self._local_heterogeneity_cache,
+                    key,
+                    item,
+                )
+            output.append(replace(item, metric=normalize_cap_coverage_metric(config.selected_cap_coverage_metric)))
         return output
 
     def render_stage(
@@ -2420,6 +2588,7 @@ class CoverageDiagnosticAdapter:
         current_config: CoverageViewerConfig | None = None,
     ) -> str:
         config = self._effective_config(result, current_config)
+        coverage_branch = _coverage_branch_label(config)
         rois = self._selected_rois(result, roi_selection)
         pixel_text = (
             f" | pixel {_format_coverage_length_m(result.metadata.mean_pixel_size_m)}/px"
@@ -2454,15 +2623,26 @@ class CoverageDiagnosticAdapter:
                 and cap.surface_weighted_fraction is not None
                 and cap.projected_over_cap_surface is not None else "cap invalid"
             )
-            sphere_diameter = _cap_sphere_diameter_px(
-                metrics.equivalent_diameter_px, metrics.x_diameter_px,
-                metrics.y_diameter_px, config.sphere_diameter_metric,
+            sphere_diameter = 2.0 * self._sphere_geometry(roi, config).radius_px
+            local = self.local_heterogeneity_data(result, roi.roi_index, config)
+            domain = local[0].domain if local else None
+            domain_value = domain.components(selected_metric).value if domain is not None else None
+            domain_text = (
+                f"domain C {domain_value * 100.0:.2f}% over "
+                f"{config.local_heterogeneity_inner_radius_fraction:.2f}–{config.local_heterogeneity_outer_radius_fraction:.2f} R "
+                f"(completeness {domain.completeness:.3f}, grid Δ {local[0].metrics[selected_metric].reconstruction_delta_pp:.3g} pp)"
+                if domain is not None and domain_value is not None else "domain C n/a"
+            )
+            fixed_cap_text = (
+                f"cap C {selected_value * 100.0:.2f}% at {config.coverage_cap_radius_fraction:.2f} R"
+                if selected_value is not None else "cap C invalid"
             )
             return (
                 f"ROI {roi.roi_index} | {self._coverage_status(roi, config)} | "
                 f"selected {cap_text if config.coverage_cap_enabled else f'legacy {roi.legacy_full_projected_coverage_percent:.2f}%'} | "
                 f"legacy {roi.legacy_full_projected_coverage_percent:.2f}% | {cap_values} | "
                 f"sphere ({config.sphere_diameter_metric}) {sphere_diameter:.1f} px | "
+                f"{fixed_cap_text} | {domain_text} | "
                 f"cap a/R {cap.geometry.radius_fraction:.2f}, a {cap.geometry.cap_radius_px:.1f} px, "
                 f"angle {cap.geometry.half_angle_deg:.1f} deg, completeness {cap.geometry.completeness:.3f}, "
                 f"bead/Ag cap px {cap.bead_pixel_count}/{cap.ag_pixel_count} | projected {roi.projected_ag_count} | "
@@ -2471,6 +2651,7 @@ class CoverageDiagnosticAdapter:
                 f"solidity {metrics.solidity:.3f} | count thr {roi.ag_count_threshold:.4f} | "
                 f"cov thr {roi.ag_coverage_threshold:.4f} | bead px {roi.bead_area_px} | "
                 f"Ag px {roi.ag_area_px} | analysis {duration_s:.3f} s{pixel_text}"
+                f" | {coverage_branch}"
             )
         included = [
             roi for roi in result.roi_results if _include_roi_in_global_summary(roi, config)
@@ -2498,6 +2679,7 @@ class CoverageDiagnosticAdapter:
             f"mean cov {mean_cov} | median cov {median_cov} | "
             f"projected {total_projected} | sphere {total_sphere:.1f} | "
             f"mean density {mean_density} | analysis {duration_s:.3f} s{pixel_text}"
+            f" | {coverage_branch}"
         )
 
     def overlay_labels(self, config: CoverageViewerConfig) -> tuple[str, ...]:
@@ -2505,7 +2687,6 @@ class CoverageDiagnosticAdapter:
             "Bead boundaries",
             "ROI inclusion status",
             self.measurement_line_label,
-            self.measurement_text_label,
             "Ag coverage boundaries",
             "Ag count boundaries",
             "Ag peak markers",
@@ -2513,7 +2694,10 @@ class CoverageDiagnosticAdapter:
             "Cap boundary",
             "Cap center",
             "Cap completeness status",
-            "Homogeneity boundaries",
+            "Inscribed circle",
+            "Local heterogeneity radial bands",
+            "Local heterogeneity polar sectors",
+            "Local heterogeneity coverage map",
             "Rejected candidate boundaries",
             "Raw candidate boundaries",
             "Rejected candidate labels",
@@ -2525,7 +2709,6 @@ class CoverageDiagnosticAdapter:
             "Bead boundaries": bool(config.default_show_bead_boundary),
             "ROI inclusion status": True,
             self.measurement_line_label: bool(config.default_show_diameter_lines),
-            self.measurement_text_label: bool(config.default_show_diameter_lines),
             "Ag coverage boundaries": bool(config.default_show_ag_boundary),
             "Ag count boundaries": bool(config.default_show_ag_count_boundary),
             "Ag peak markers": bool(config.default_show_ag_peaks),
@@ -2533,7 +2716,10 @@ class CoverageDiagnosticAdapter:
             "Cap boundary": True,
             "Cap center": True,
             "Cap completeness status": True,
-            "Homogeneity boundaries": True,
+            "Inscribed circle": False,
+            "Local heterogeneity radial bands": True,
+            "Local heterogeneity polar sectors": True,
+            "Local heterogeneity coverage map": False,
             "Rejected candidate boundaries": True,
             "Raw candidate boundaries": False,
             "Rejected candidate labels": True,
@@ -2671,8 +2857,14 @@ def effective_config_values(
     return adapter.update_config(base_config, changes)
 
 
+_UNSET_DATA_SOURCE = object()
+
+
 def save_tuned_config(
-    raw_source_config: Mapping[str, Any], viewer_config: Any, output_path: str | Path
+    raw_source_config: Mapping[str, Any], viewer_config: Any, output_path: str | Path,
+    *,
+    effective_folder: Path | None | object = _UNSET_DATA_SOURCE,
+    effective_file: str | None | object = _UNSET_DATA_SOURCE,
 ) -> Path:
     """Write a tuned copy while preserving all non-viewer top-level fields."""
 
@@ -2690,9 +2882,149 @@ def save_tuned_config(
     viewer_payload = deepcopy(source_viewer) if isinstance(source_viewer, dict) else {}
     viewer_payload = _merge_dicts(viewer_payload, asdict(viewer_config))
     payload["viewer"] = viewer_payload
+    # Direct callers retain the source fields already in the template.  The
+    # diagnostic window always passes both values explicitly, including the
+    # explicit no-data pair (None, None).
+    if effective_folder is not _UNSET_DATA_SOURCE:
+        payload["folder"] = path_to_config_text(effective_folder) if effective_folder is not None else ""
+    if effective_file is not _UNSET_DATA_SOURCE:
+        payload["file"] = effective_file or None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return output_path
+
+
+def choose_json_save_path(initial_path: Path, figure: Figure) -> Path | None:
+    """Choose a JSON destination with the standard-library native Tk dialog."""
+    root: Any | None = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root=tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+        selected=filedialog.asksaveasfilename(parent=root, initialdir=str(initial_path.parent), initialfile=initial_path.name, defaultextension=".json", filetypes=(("JSON files","*.json"),("All files","*.*")))
+    except Exception:
+        LOGGER.debug("Native save dialog unavailable", exc_info=True)
+        return None
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+    if not selected: return None
+    path=Path(selected)
+    return path if path.suffix else path.with_suffix(".json")
+
+
+@dataclass(frozen=True)
+class SelectedDataSource:
+    folder: Path
+    file: str | None
+
+
+@dataclass(frozen=True)
+class DataSourceDialogResult:
+    """Outcome of the native image/folder chooser.
+
+    A backend failure is deliberately distinct from an ordinary cancellation.
+    """
+
+    source: SelectedDataSource | None
+    cancelled: bool
+    error_message: str | None = None
+
+
+def choose_data_source(initial_directory: Path | None, figure: Figure) -> DataSourceDialogResult:
+    """Use a viewable, short-lived Tk modal to choose one image or a folder."""
+    root: Any | None = None
+    dialog: Any | None = None
+    choice: dict[str, SelectedDataSource | None] = {"value": None}
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        dialog = tk.Toplevel(root)
+        dialog.title("Load diagnostic data")
+        dialog.transient(root)
+
+        def finish() -> None:
+            # The outer finally block owns destruction, avoiding double-destroy
+            # races from Tk button callbacks.
+            dialog.quit()
+
+        def select_file() -> None:
+            path = filedialog.askopenfilename(parent=dialog, initialdir=str(initial_directory or Path.cwd()), filetypes=(("Supported images", "*.tif *.tiff *.png *.jpg *.jpeg"), ("All files", "*.*")))
+            if path:
+                choice["value"] = SelectedDataSource(Path(path).parent, Path(path).name)
+            finish()
+
+        def select_folder() -> None:
+            path = filedialog.askdirectory(parent=dialog, initialdir=str(initial_directory or Path.cwd()))
+            if path:
+                choice["value"] = SelectedDataSource(Path(path), None)
+            finish()
+
+        tk.Button(dialog, text="Select image", command=select_file).pack(fill="x", padx=12, pady=(12, 4))
+        tk.Button(dialog, text="Select folder", command=select_folder).pack(fill="x", padx=12, pady=4)
+        tk.Button(dialog, text="Cancel", command=finish).pack(fill="x", padx=12, pady=(4, 12))
+        dialog.protocol("WM_DELETE_WINDOW", finish)
+        dialog.update_idletasks()
+        dialog.deiconify()
+        dialog.lift()
+        dialog.wait_visibility()
+        dialog.grab_set()
+        root.mainloop()
+        return DataSourceDialogResult(choice["value"], choice["value"] is None)
+    except Exception as exc:
+        LOGGER.exception("Could not open native data-source dialog")
+        return DataSourceDialogResult(None, False, str(exc))
+    finally:
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+class _DaemonTaskRunner:
+    """Minimal Future runner for disposable diagnostic calculations."""
+
+    def __init__(self) -> None:
+        self._shutdown = False
+
+    def submit(self, function: Callable[..., Any], *args: Any) -> Future[Any]:
+        future: Future[Any] = Future()
+        if self._shutdown:
+            future.cancel()
+            return future
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(function(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        Thread(target=run, name="sem-coverage-diagnostic", daemon=True).start()
+        return future
+
+    def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
+        """A daemon task is abandoned after the controller has been closed."""
+
+        self._shutdown = True
 
 
 class AnalysisController:
@@ -2711,7 +3043,7 @@ class AnalysisController:
         self._cache: OrderedDict[tuple[str, Any], tuple[Any, float]] = OrderedDict()
         self._failure_cache: OrderedDict[tuple[str, Any], tuple[BaseException, float]] = OrderedDict()
         self._completed: Queue[AnalysisCompletion] = Queue()
-        self._executor = ThreadPoolExecutor(max_workers=1) if asynchronous else None
+        self._executor = _DaemonTaskRunner() if asynchronous else None
         self._lock = RLock()
         self._running: Future[Any] | None = None
         self._running_meta: tuple[int, float] | None = None
@@ -2857,13 +3189,15 @@ class AnalysisController:
             self._store_failure(
                 completion.image_path, completion.config, completion.error, completion.duration_s
             )
-        self._completed.put(completion)
         with self._lock:
             self._running = None
             self._running_meta = None
+            if self._closed:
+                return
+            self._completed.put(completion)
             pending = self._pending
             self._pending = None
-            if pending is not None and not self._closed:
+            if pending is not None:
                 self._start_locked(*pending)
 
     def _store_cache(
@@ -2871,6 +3205,8 @@ class AnalysisController:
     ) -> None:
         key = self._cache_key(image_path, config)
         with self._lock:
+            if self._closed:
+                return
             self._cache[key] = (result, duration_s)
             self._cache.move_to_end(key)
             while len(self._cache) > self._cache_size:
@@ -2881,6 +3217,8 @@ class AnalysisController:
     ) -> None:
         key = self._cache_key(image_path, config)
         with self._lock:
+            if self._closed:
+                return
             self._failure_cache[key] = (error, duration_s)
             self._failure_cache.move_to_end(key)
             while len(self._failure_cache) > self._cache_size:
@@ -2935,7 +3273,16 @@ class AnalysisController:
         if running is not None:
             running.cancel()
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            # A running Python thread cannot be cancelled safely.  Diagnostic
+            # results are ignored after closure, so never block a GUI close on
+            # an in-flight calculation.
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        self.clear_cache()
+        while True:
+            try:
+                self._completed.get_nowait()
+            except Empty:
+                break
 
 
 @dataclass
@@ -2964,7 +3311,8 @@ class DiagnosticViewer:
     ) -> None:
         self.adapter = adapter
         self.config_path = Path(config_path).expanduser().resolve()
-        self.selected_file = Path(selected_file).expanduser() if selected_file else None
+        self._cli_selected_file = Path(selected_file).expanduser() if selected_file else None
+        self.selected_file = self._cli_selected_file
         self.folder_override = (
             Path(folder_override).expanduser().resolve() if folder_override else None
         )
@@ -2979,13 +3327,23 @@ class DiagnosticViewer:
             self.adapter.load_config(self.config_path)
         )
         self.current_viewer_config = self.original_viewer_config
-        self.folder = self.folder_override or Path(self.app_config.folder).expanduser()
-        self.image_paths = self.adapter.resolve_images(
-            self.folder, self.app_config, self.selected_file
-        )
-        self.index = self._resolve_start_index(self.selected_file)
+        self.folder = self.folder_override or (Path(self.app_config.folder).expanduser() if self.app_config.folder else None)
+        self.image_paths: list[Path] = []
+        self._data_message = ""
+        if self.folder is not None:
+            try:
+                self.image_paths = self.adapter.resolve_images(self.folder, self.app_config, self.selected_file)
+            except (OSError, ValueError, FileNotFoundError) as exc:
+                self._data_message = f"No data loaded: {exc}"
+        if self.selected_file is None and self.app_config.file and self.image_paths:
+            # A config-level file selection has the same effective source
+            # semantics as a file selected through the native dialog.
+            self.selected_file = Path(self.image_paths[0].name)
+        if not self.image_paths and not self._data_message:
+            self._data_message = "No data loaded. Use Load data to select an image or folder."
+        self.index = self._resolve_start_index(self.selected_file) if self.image_paths else 0
         validation = self.adapter.validate_config(
-            self.current_viewer_config, self.image_paths[self.index]
+            self.current_viewer_config, self.image_paths[self.index] if self.image_paths else None
         )
         if validation:
             raise ValueError(f"Invalid source viewer configuration: {validation}")
@@ -3012,6 +3370,7 @@ class DiagnosticViewer:
         self._reset_view_on_next_result = True
         self._roi_selection: int | None = None
         self._slider_change_pending = False
+        self._last_hover_target: tuple[Any, ...] | None = None
         self._supports_roi_selection = bool(getattr(self.adapter, "supports_roi_selection", False))
         self.HELP_TEXT = self._build_help_text()
 
@@ -3043,9 +3402,27 @@ class DiagnosticViewer:
         self._button_callback_ids: list[int] = []
         self._group_radio_callback_id: int | None = None
         self._overlay_checks_callback_id: int | None = None
-        self._canvas_callback_ids: list[int] = []
+        self._main_canvas_callback_ids: list[int] = []
+        self._graph_canvas_callback_ids: list[int] = []
         self._control_slot_axes: list[Axes] = []
         self.cap_graph_axis: Axes | None = None
+        self.graph_main_axis: Axes | None = None
+        self.graph_heatmap_axis: Axes | None = None
+        self.graph_polar_axis: Axes | None = None
+        self.graph_radial_axis: Axes | None = None
+        self.graph_summary_axis: Axes | None = None
+        self.graph_colorbar_axis: Axes | None = None
+        self.graph_fig: Figure | None = None
+        self.graph_status_text: Text | None = None
+        self.local_graph_hover_artist: Rectangle | None = None
+        self.local_radial_hover_artist: Line2D | None = None
+        self.local_polar_hover_artist: Line2D | None = None
+        self.homogeneity_artists: list[Any] = []
+        self.homogeneity_hover_artists: list[Any] = []
+        self.local_geometry_artists: list[Any] = []
+        self.inscribed_geometry_artists: list[Any] = []
+        self.homogeneity_info_text: Text | None = None
+        self.homogeneity_graph_hover_artist: Any = None
         self.dimension_lines: list[tuple[Line2D, Line2D]] = []
         self.measurement_labels: list[Text] = []
         self._measurement_label_groups: list[tuple[Text, Text, Text]] = []
@@ -3059,7 +3436,10 @@ class DiagnosticViewer:
         self.overlay_state = self.adapter.default_overlay_state(self.current_viewer_config)
 
         self._build_figure()
-        self._schedule_analysis(immediate=True)
+        if self.image_paths:
+            self._schedule_analysis(immediate=True)
+        else:
+            self._show_no_data_state()
 
     def _resolve_start_index(self, selected_file: str | Path | None) -> int:
         if selected_file is None:
@@ -3103,7 +3483,13 @@ class DiagnosticViewer:
             initial_image = self._make_placeholder_image()
         transparent = np.zeros((*initial_image.shape[:2], 4), dtype=np.float32)
         self.image_artist = self.ax_image.imshow(initial_image, interpolation="nearest")
-        self.boundary_artist = self.ax_image.imshow(transparent, interpolation="nearest")
+        self.boundary_artist = self.ax_image.imshow(transparent, interpolation="nearest", zorder=3)
+        self.local_coverage_artist = self.ax_image.imshow(transparent, interpolation="nearest", zorder=1.5)
+        self.local_coverage_artist.set_visible(False)
+        self.radial_hover_patch = Wedge((0, 0), 1, 0, 360, width=0.5, facecolor="yellow", edgecolor="yellow", alpha=0.22, linewidth=1.8, visible=False, zorder=21)
+        self.ax_image.add_patch(self.radial_hover_patch)
+        self.local_hover_patch = Wedge((0, 0), 1, 0, 1, width=.5, facecolor="#ffe600", edgecolor="#ffe600", alpha=.22, linewidth=1.8, visible=False, zorder=22)
+        self.ax_image.add_patch(self.local_hover_patch)
         self.ax_image.axis("off")
         self.loading_text = self.ax_image.text(
             0.5,
@@ -3122,7 +3508,8 @@ class DiagnosticViewer:
         )
         self._set_main_image(initial_image, reset_view=True)
 
-        ax_groups = self.fig.add_axes([0.70, 0.765, 0.135, 0.20])
+        self.ax_parameter_groups = self.fig.add_axes([0.70, 0.765, 0.135, 0.20])
+        ax_groups = self.ax_parameter_groups
         ax_groups.set_title("Parameter group", fontsize=9)
         self.group_radio = RadioButtons(
             ax_groups, self.group_names, active=0, activecolor="#2878b5"
@@ -3132,7 +3519,8 @@ class DiagnosticViewer:
         self._group_radio_callback_id = self.group_radio.on_clicked(self._on_group_selected)
 
         overlay_height = 0.20 if len(self.overlay_labels) <= 6 else 0.26
-        ax_overlays = self.fig.add_axes([0.845, 0.965 - overlay_height, 0.145, overlay_height])
+        self.ax_overlay_controls = self.fig.add_axes([0.845, 0.965 - overlay_height, 0.145, overlay_height])
+        ax_overlays = self.ax_overlay_controls
         ax_overlays.set_title("Overlay", fontsize=9)
         self.overlay_checks = CheckButtons(
             ax_overlays,
@@ -3146,9 +3534,25 @@ class DiagnosticViewer:
         )
 
         self._build_control_slots()
-        self.cap_graph_axis = self.fig.add_axes([0.705, 0.145, 0.275, 0.155])
-        self.cap_graph_axis.set_visible(False)
+        # Large analytic plots live in a synchronized second figure so widget
+        # axes in the control window never compete with graph typography.
+        self.graph_fig = plt.figure(figsize=(9.5, 7.0))
+        self.graph_fig.canvas.manager.set_window_title("SEM coverage diagnostics – graphs")
+        grid = self.graph_fig.add_gridspec(2, 3, height_ratios=(1.0, 3.0), width_ratios=(4.5, 1.25, .18), left=.07, right=.96, bottom=.13, top=.93, hspace=.38, wspace=.32)
+        self.graph_main_axis = self.graph_fig.add_axes([.08, .15, .84, .74])
+        self.cap_graph_axis = self.graph_main_axis  # compatibility for cap/legacy helpers
+        self.graph_heatmap_axis = self.graph_fig.add_subplot(grid[1, 0])
+        self.graph_polar_axis = self.graph_fig.add_subplot(grid[0, 0])
+        self.graph_radial_axis = self.graph_fig.add_subplot(grid[1, 1])
+        self.graph_summary_axis = self.graph_fig.add_subplot(grid[0, 1])
+        self.graph_colorbar_axis = self.graph_fig.add_subplot(grid[1, 2])
+        for axis in (self.graph_main_axis, self.graph_heatmap_axis, self.graph_polar_axis, self.graph_radial_axis, self.graph_summary_axis, self.graph_colorbar_axis):
+            axis.set_visible(False)
+        graph_status_axis = self.graph_fig.add_axes([0.07, 0.035, 0.89, 0.055])
+        graph_status_axis.axis("off")
+        self.graph_status_text = graph_status_axis.text(0.0, 0.8, "", va="top", fontsize=9)
         self._rebuild_parameter_controls()
+        self._layout_right_panel_for_group()
         self._build_buttons()
 
         ax_status = self.fig.add_axes([0.025, 0.012, 0.965, 0.062])
@@ -3157,14 +3561,20 @@ class DiagnosticViewer:
             0.0, 1.0, "", va="top", ha="left", fontsize=9, wrap=True
         )
 
-        self._canvas_callback_ids.extend(
+        self._main_canvas_callback_ids.extend(
             [
                 self.fig.canvas.mpl_connect("key_press_event", self._on_key),
                 self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion),
                 self.fig.canvas.mpl_connect("button_release_event", self._on_button_release),
+                self.fig.canvas.mpl_connect("resize_event", self._on_resize),
                 self.fig.canvas.mpl_connect("close_event", self._on_close),
             ]
         )
+        self._graph_canvas_callback_ids.extend([
+            self.graph_fig.canvas.mpl_connect("close_event", self._on_graph_close),
+            self.graph_fig.canvas.mpl_connect("motion_notify_event", self._on_graph_motion),
+            self.graph_fig.canvas.mpl_connect("resize_event", self._on_resize),
+        ])
 
         self._debounce_timer = self.fig.canvas.new_timer(interval=self.debounce_ms)
         self._debounce_timer.single_shot = True
@@ -3297,6 +3707,7 @@ class DiagnosticViewer:
 
     def _build_buttons(self) -> None:
         definitions: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("Load data", self.load_data),
             ("Previous", self.previous_image),
             ("Next", self.next_image),
         )
@@ -3315,6 +3726,7 @@ class DiagnosticViewer:
         )
         left = 0.025
         width_map = {
+            "Load data": 0.080,
             "Previous": 0.070,
             "Next": 0.070,
             "Previous ROI": 0.078,
@@ -3337,12 +3749,83 @@ class DiagnosticViewer:
             self._button_callback_ids.append(callback_id)
             left += button_width + gap
 
+    def load_data(self) -> None:
+        """Replace only the effective image source, retaining tuned parameters."""
+        outcome = choose_data_source(self.folder, self.fig)
+        if outcome.error_message:
+            self._message = f"Could not open the data-source dialog: {outcome.error_message}"
+            self._update_status()
+            return
+        if outcome.cancelled:
+            self._message = "Load data cancelled."
+            self._update_status()
+            return
+        if outcome.source is not None:
+            self._apply_data_source(outcome.source.folder, outcome.source.file)
+
+    def _apply_data_source(self, folder: Path, file: str | None) -> None:
+        try:
+            app = replace(self.app_config, folder=str(folder), file=file)
+            paths = self.adapter.resolve_images(folder, app, Path(file) if file else None)
+            if not paths:
+                raise FileNotFoundError("No supported images found.")
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            self.folder = folder
+            self.selected_file = Path(file) if file else None
+            self.image_paths = []
+            self.index = 0
+            self._data_message = f"No data loaded: {exc}"
+            self._message = self._data_message
+            self._show_no_data_state()
+            return
+        self.app_config = app
+        self.folder = folder.resolve()
+        self.selected_file = Path(file) if file else None
+        self.image_paths = paths
+        self.index = 0
+        self._roi_selection = None
+        self.current_result = self.current_preview = None
+        self.current_error = None
+        self.controller.clear_cache()
+        self._data_message = ""
+        self._message = f"Loaded {len(paths)} image(s)."
+        self._reset_view_on_next_result = True
+        self._show_loading_preview()
+        self._schedule_analysis(immediate=True)
+
     def _on_group_selected(self, label: str) -> None:
         self.current_group = label
         self._help_message = ""
         self._rebuild_parameter_controls()
+        self._layout_right_panel_for_group()
+        # A group switch changes control and graph layout, not the analysed
+        # image.  Keep the existing base image/boundary artists and update only
+        # local-grid artists whose visibility is group-dependent.
+        self._update_local_geometry_artists()
+        self._update_local_coverage_map()
         self._update_cap_graph()
         self._update_status()
+
+    def _layout_right_panel_for_group(self) -> None:
+        """Lay out control widgets below the header panels in the main window."""
+        header_bottom = min(self.ax_parameter_groups.get_position().y0, self.ax_overlay_controls.get_position().y0)
+        top, bottom = header_bottom - 0.015, 0.145
+        count = len(self.groups[self.current_group]); height = 0.033
+        gap = max((top-bottom-count*height)/max(count-1,1), 0.008)
+        for index, axis in enumerate(self._control_slot_axes):
+            if index < count:
+                axis.set_position([0.705, top-(index+1)*height-index*gap, 0.275, height])
+
+    def _active_widget_overlaps(self) -> list[tuple[str, str]]:
+        """Return visible axes intersections for layout tests and DEBUG checks."""
+        axes=[(name, control.axis) for name,control in self._controls.items() if control.axis.get_visible()]
+        axes += [("parameter groups",self.ax_parameter_groups),("overlay",self.ax_overlay_controls)]
+        axes += [("button",button.ax) for button in self._buttons]
+        out=[]
+        for i,(a,aa) in enumerate(axes):
+            for b,bb in axes[i+1:]:
+                if aa.get_position().overlaps(bb.get_position()): out.append((a,b))
+        return out
 
     @property
     def has_pending_changes(self) -> bool:
@@ -3372,7 +3855,7 @@ class DiagnosticViewer:
             )
         except ValueError:
             return None
-        validation = self.adapter.validate_config(candidate, self.image_paths[self.index])
+        validation = self.adapter.validate_config(candidate, self.image_paths[self.index] if self.image_paths else None)
         if validation:
             return None
         return candidate
@@ -3419,9 +3902,8 @@ class DiagnosticViewer:
             if artist is not None and hasattr(artist, "set_alpha"):
                 artist.set_alpha(alpha)
 
-    def _activity_for_control(self, control: _Control) -> tuple[bool, str]:
+    def _activity_for_control(self, control: _Control, config: Any) -> tuple[bool, str]:
         spec = control.spec
-        config = self._current_valid_config() or self.current_viewer_config
         if spec.active_when is None:
             return True, ""
         outcome = spec.active_when(config)
@@ -3430,8 +3912,9 @@ class DiagnosticViewer:
         return bool(outcome), ""
 
     def _update_control_activity_states(self) -> None:
+        candidate = self._current_valid_config() or self.current_viewer_config
         for control in self._controls.values():
-            active, reason = self._activity_for_control(control)
+            active, reason = self._activity_for_control(control, candidate)
             control.inactive_reason = reason
             self._set_widget_enabled(control, active)
 
@@ -3499,7 +3982,7 @@ class DiagnosticViewer:
             self._set_validation_error(str(exc))
             self._update_status()
             return
-        validation = self.adapter.validate_config(candidate, self.image_paths[self.index])
+        validation = self.adapter.validate_config(candidate, self.image_paths[self.index] if self.image_paths else None)
         self._help_message = self._control_help_text(spec)
         if validation:
             self._set_validation_error(validation)
@@ -3508,14 +3991,13 @@ class DiagnosticViewer:
         self.current_viewer_config = candidate
         self._clear_validation_error()
         self._update_control_activity_states()
-        if name in {
-            "coverage_cap_radius_fraction", "coverage_cap_min_completeness",
-            "sphere_diameter_metric", "selected_cap_coverage_metric", "coverage_cap_graph_mode",
-        }:
-            self._update_cap_graph()
         if spec.kind in {"float", "int", "range"}:
             self._slider_change_pending = True
             self._message = "Pending changes. Release the mouse or use Apply changes."
+            # Slider motion changes only the tentative value.  Cap curves and
+            # local robust rotations are deliberately deferred to mouse release.
+            self._update_status()
+            return
         elif spec.kind == "bool":
             self._commit_current_controls()
             return
@@ -3525,7 +4007,10 @@ class DiagnosticViewer:
         self._update_status()
 
     def _on_motion(self, event: MouseEvent) -> None:
+        if not hasattr(event, "inaxes"):
+            return
         if event.inaxes is None:
+            self._clear_homogeneity_hover()
             return
         for control in self._controls.values():
             if event.inaxes is control.axis and control.axis.get_visible():
@@ -3534,16 +4019,273 @@ class DiagnosticViewer:
                     self._help_message = help_text
                     self._update_status()
                 return
+        if self.current_group == "Coverage local heterogeneity":
+            self._update_local_hover_from_image(event)
+        else:
+            self._update_homogeneity_hover(event)
+
+    def _clear_homogeneity_hover(self) -> None:
+        visible = (
+            self.radial_hover_patch.get_visible() or self.local_hover_patch.get_visible()
+            or (self.local_graph_hover_artist is not None and self.local_graph_hover_artist.get_visible())
+            or (self.local_radial_hover_artist is not None and self.local_radial_hover_artist.get_visible())
+            or (self.local_polar_hover_artist is not None and self.local_polar_hover_artist.get_visible())
+            or any(artist.get_visible() for artist in self.homogeneity_hover_artists)
+        )
+        self._last_hover_target = None
+        if not visible:
+            return
+        self.radial_hover_patch.set_visible(False)
+        self.local_hover_patch.set_visible(False)
+        if self.local_graph_hover_artist is not None:
+            self.local_graph_hover_artist.set_visible(False)
+        if self.local_radial_hover_artist is not None:
+            self.local_radial_hover_artist.set_data([], [])
+            self.local_radial_hover_artist.set_visible(False)
+        if self.local_polar_hover_artist is not None:
+            self.local_polar_hover_artist.set_data([], [])
+            self.local_polar_hover_artist.set_visible(False)
+        for artist in self.homogeneity_hover_artists:
+            artist.set_visible(False)
+        self._hide_homogeneity_graph_hover()
+        if not self._closed:
+            self.fig.canvas.draw_idle()
+            if self.graph_fig is not None:
+                self.graph_fig.canvas.draw_idle()
+
+    def _update_local_hover_from_image(self, event: MouseEvent) -> None:
+        """Highlight the local-grid cell under the image cursor without recomputation."""
+
+        if not (event.inaxes is self.ax_image and self.current_result is not None and self.current_viewer_config.local_heterogeneity_enabled):
+            self._clear_homogeneity_hover(); return
+        provider = getattr(self.adapter, "local_heterogeneity_data", None)
+        select = getattr(self.adapter, "_selected_rois", None)
+        if not callable(provider) or not callable(select) or event.xdata is None or event.ydata is None:
+            return
+        selection = self._roi_selection
+        if selection is None:
+            row, col = int(round(event.ydata)), int(round(event.xdata))
+            hit = next((roi for roi in select(self.current_result, None) if 0 <= row < roi.bead_mask.shape[0] and 0 <= col < roi.bead_mask.shape[1] and roi.bead_mask[row, col]), None)
+            if hit is None: self._clear_homogeneity_hover(); return
+            selection = hit.roi_index
+        rois, data = select(self.current_result, selection), provider(self.current_result, selection, self.current_viewer_config)
+        if not rois or not data: self._clear_homogeneity_hover(); return
+        roi, grid = rois[0], data[0]
+        row, col = int(round(event.ydata)), int(round(event.xdata))
+        if not (0 <= row < grid.r_over_R.shape[0] and 0 <= col < grid.r_over_R.shape[1]): self._clear_homogeneity_hover(); return
+        indices = local_grid_indices(grid, row, col)
+        if indices is None:
+            self._clear_homogeneity_hover()
+            return
+        radial, sector = indices
+        target = (roi.roi_index, radial, sector)
+        if target == self._last_hover_target:
+            return
+        self._last_hover_target = target
+        geometry = self.adapter._sphere_geometry(roi, self.current_viewer_config)
+        center = (geometry.center_rc[1], geometry.center_rc[0])
+        self.local_hover_patch.set_center(center)
+        self.local_hover_patch.set_radius(grid.radial_edges[radial + 1] * geometry.radius_px)
+        self.local_hover_patch.set_width((grid.radial_edges[radial + 1] - grid.radial_edges[radial]) * geometry.radius_px)
+        self.local_hover_patch.set_theta1(float(grid.sector_edges_deg[sector]))
+        self.local_hover_patch.set_theta2(float(grid.sector_edges_deg[sector + 1]))
+        self.local_hover_patch.set_visible(True)
+        if self.local_graph_hover_artist is not None:
+            self.local_graph_hover_artist.set_bounds(float(grid.sector_edges_deg[sector]), float(grid.radial_edges[radial]), float(grid.sector_edges_deg[sector + 1] - grid.sector_edges_deg[sector]), float(grid.radial_edges[radial + 1] - grid.radial_edges[radial]))
+            self.local_graph_hover_artist.set_visible(True)
+        if self.local_radial_hover_artist is not None:
+            self.local_radial_hover_artist.set_data([grid.radial_profile[radial] * 100.0], [(grid.radial_edges[radial] + grid.radial_edges[radial + 1]) / 2.0]); self.local_radial_hover_artist.set_visible(True)
+        if self.local_polar_hover_artist is not None:
+            self.local_polar_hover_artist.set_data([(grid.sector_edges_deg[sector] + grid.sector_edges_deg[sector + 1]) / 2.0], [grid.polar_profile[sector] * 100.0]); self.local_polar_hover_artist.set_visible(True)
+        value = grid.values[radial, sector]
+        cell = next(
+            (item for item in grid.cells if item.radial_index == radial and item.sector_index == sector),
+            None,
+        )
+        branch = _coverage_branch_label(self.current_viewer_config)
+        self._message = (
+            f"ROI {roi.roi_index}, local cell r{radial + 1}, φ{sector + 1}: "
+            f"{value * 100.0:.2f}% | completeness "
+            f"{cell.completeness:.3f} | {branch}"
+            if np.isfinite(value) and cell is not None
+            else f"ROI {roi.roi_index}, local cell r{radial + 1}, φ{sector + 1}: invalid | {branch}"
+        )
+        self._update_status(); self.fig.canvas.draw_idle()
+        if self.graph_fig is not None: self.graph_fig.canvas.draw_idle()
+
+    def _on_graph_motion(self, event: MouseEvent) -> None:
+        """Map a joint-grid heatmap cell back to the corresponding image wedge."""
+
+        if not hasattr(event, "inaxes"):
+            return
+        if self._closed or self.current_group != "Coverage local heterogeneity":
+            return
+        if event.inaxes not in {
+            self.graph_heatmap_axis,
+            self.graph_radial_axis,
+            self.graph_polar_axis,
+        } or event.xdata is None or event.ydata is None:
+            self._clear_homogeneity_hover()
+            return
+        provider = getattr(self.adapter, "local_heterogeneity_data", None)
+        select = getattr(self.adapter, "_selected_rois", None)
+        if not callable(provider) or not callable(select) or self.current_result is None:
+            return
+        rois, data = select(self.current_result, self._roi_selection), provider(self.current_result, self._roi_selection, self.current_viewer_config)
+        if not rois or not data:
+            self._clear_homogeneity_hover()
+            return
+        grid, roi = data[0], rois[0]
+        radial = sector = None
+        if event.inaxes is self.graph_heatmap_axis:
+            radial = int(np.searchsorted(grid.radial_edges, event.ydata, side="right") - 1)
+            angle = min(max(float(event.xdata), 0.0), float(np.nextafter(360.0, 0.0)))
+            sector = int(np.searchsorted(grid.sector_edges_deg, angle, side="right") - 1)
+        elif event.inaxes is self.graph_radial_axis:
+            radial = int(np.argmin(np.abs((grid.radial_edges[:-1] + grid.radial_edges[1:]) / 2.0 - event.ydata)))
+        elif event.inaxes is self.graph_polar_axis:
+            sector = int(np.argmin(np.abs((grid.sector_edges_deg[:-1] + grid.sector_edges_deg[1:]) / 2.0 - event.xdata)))
+        if radial is not None and not (0 <= radial < len(grid.radial_edges) - 1):
+            self._clear_homogeneity_hover()
+            return
+        if sector is not None and not (0 <= sector < self.current_viewer_config.local_heterogeneity_polar_sector_count):
+            self._clear_homogeneity_hover()
+            return
+        geometry = self.adapter._sphere_geometry(roi, self.current_viewer_config)
+        self.local_hover_patch.set_center((geometry.center_rc[1], geometry.center_rc[0]))
+        lo_r = grid.radial_edges[radial] if radial is not None else grid.radial_edges[0]
+        hi_r = grid.radial_edges[radial + 1] if radial is not None else grid.radial_edges[-1]
+        lo_phi = grid.sector_edges_deg[sector] if sector is not None else grid.sector_edges_deg[0]
+        hi_phi = grid.sector_edges_deg[sector + 1] if sector is not None else grid.sector_edges_deg[-1]
+        self.local_hover_patch.set_radius(hi_r * geometry.radius_px)
+        self.local_hover_patch.set_width((hi_r - lo_r) * geometry.radius_px)
+        self.local_hover_patch.set_theta1(float(lo_phi))
+        self.local_hover_patch.set_theta2(float(hi_phi))
+        self.local_hover_patch.set_visible(True)
+        if self.local_graph_hover_artist is not None:
+            graph_x0 = float(grid.sector_edges_deg[sector]) if sector is not None else float(grid.sector_edges_deg[0])
+            graph_x1 = float(grid.sector_edges_deg[sector + 1]) if sector is not None else float(grid.sector_edges_deg[-1])
+            graph_y0 = float(grid.radial_edges[radial]) if radial is not None else float(grid.radial_edges[0])
+            graph_y1 = float(grid.radial_edges[radial + 1]) if radial is not None else float(grid.radial_edges[-1])
+            self.local_graph_hover_artist.set_bounds(graph_x0, graph_y0, graph_x1 - graph_x0, graph_y1 - graph_y0)
+            self.local_graph_hover_artist.set_visible(True)
+        if radial is not None and self.local_radial_hover_artist is not None:
+            self.local_radial_hover_artist.set_data([grid.radial_profile[radial] * 100.0], [(grid.radial_edges[radial] + grid.radial_edges[radial + 1]) / 2.0]); self.local_radial_hover_artist.set_visible(True)
+        if sector is not None and self.local_polar_hover_artist is not None:
+            self.local_polar_hover_artist.set_data([(grid.sector_edges_deg[sector] + grid.sector_edges_deg[sector + 1]) / 2.0], [grid.polar_profile[sector] * 100.0]); self.local_polar_hover_artist.set_visible(True)
+        if radial is not None and sector is not None:
+            value = grid.values[radial, sector]
+            self._message = (
+                f"ROI {roi.roi_index}, local cell r{radial + 1}, φ{sector + 1}: "
+                f"{value * 100.0:.2f}% | {_coverage_branch_label(self.current_viewer_config)}"
+                if np.isfinite(value)
+                else f"ROI {roi.roi_index}, local cell r{radial + 1}, φ{sector + 1}: invalid"
+            )
+        elif radial is not None:
+            self._message = f"ROI {roi.roi_index}, local radial band r{radial + 1}"
+        else:
+            self._message = f"ROI {roi.roi_index}, local polar sector φ{(sector or 0) + 1}"
+        self._update_status()
+        self.fig.canvas.draw_idle()
+        if self.graph_fig is not None: self.graph_fig.canvas.draw_idle()
+
+    def _ensure_homogeneity_graph_hover_artist(self) -> Line2D | None:
+        axis = self.cap_graph_axis
+        if axis is None:
+            return None
+        artist = self.homogeneity_graph_hover_artist
+        if artist is None or getattr(artist, "axes", None) is not axis:
+            artist = axis.plot([], [], marker="o", linestyle="none", color="red", markersize=8, zorder=20)[0]
+            artist.set_visible(False)
+            self.homogeneity_graph_hover_artist = artist
+        return artist
+
+    def _hide_homogeneity_graph_hover(self) -> None:
+        artist = self.homogeneity_graph_hover_artist
+        if artist is not None and getattr(artist, "axes", None) is not None:
+            artist.set_data([], [])
+            artist.set_visible(False)
+
+    def _set_homogeneity_graph_hover(self, x: float, y: float) -> None:
+        artist = self._ensure_homogeneity_graph_hover_artist()
+        if artist is not None:
+            artist.set_data([x], [y])
+            artist.set_visible(True)
+
+    def _update_homogeneity_hover(self, event: MouseEvent) -> None:
+        if not (event.inaxes is self.ax_image and self.current_group == "Coverage homogeneity (legacy)" and self.current_result is not None):
+            self._clear_homogeneity_hover()
+            return
+        provider=getattr(self.adapter,"homogeneity_data",None); select=getattr(self.adapter,"_selected_rois",None)
+        if not callable(provider) or not callable(select) or event.xdata is None or event.ydata is None: return
+        selection=self._roi_selection
+        if selection is None:
+            all_rois=select(self.current_result,None)
+            row_i,col_i=int(round(event.ydata)),int(round(event.xdata))
+            hit=next((roi for roi in all_rois if 0<=row_i<roi.bead_mask.shape[0] and 0<=col_i<roi.bead_mask.shape[1] and roi.bead_mask[row_i,col_i]),None)
+            if hit is None: self._clear_homogeneity_hover(); return
+            selection=hit.roi_index
+        rois=select(self.current_result,selection); items=provider(self.current_result,selection,self.current_viewer_config)
+        if not rois or not items: return
+        roi,item=rois[0],items[0]; row,col=event.ydata,event.xdata
+        rr=float(item.r_over_R[int(round(row)),int(round(col))]) if 0<=round(row)<item.r_over_R.shape[0] and 0<=round(col)<item.r_over_R.shape[1] else -1
+        if not (self.current_viewer_config.homogeneity_inner_radius_fraction <= rr <= self.current_viewer_config.homogeneity_outer_radius_fraction): return
+        mode=self.current_viewer_config.homogeneity_view_mode; segments=item.rings if mode=="radial" else item.sectors
+        phi=float(item.phi_rad[int(round(row)),int(round(col))]) if mode=="polar" else 0.0
+        if mode == "radial":
+            index=next((s.index for s in segments if s.inner <= rr <= s.outer),None)
+        else:
+            delta=2*np.pi/max(1, self.current_viewer_config.polar_sector_count)
+            offset=np.radians(self.current_viewer_config.polar_display_rotation_deg)
+            index=int(np.floor(np.mod(phi-offset,2*np.pi)/delta))
+        if index is None: return
+        self._clear_homogeneity_hover()
+        s=next((segment for segment in segments if segment.index == index), None)
+        if s is None:
+            return
+        x=s.center if mode=="radial" else (((s.start_angle_deg or 0.0)+(((s.end_angle_deg or 0.0)-(s.start_angle_deg or 0.0))%360.0)/2.0)%360.0)
+        y=getattr(s,self.current_viewer_config.selected_cap_coverage_metric)
+        if self.cap_graph_axis is not None and y is not None:
+            self._set_homogeneity_graph_hover(x,y*100)
+            geometry=self.adapter._sphere_geometry(roi, self.current_viewer_config); radius=geometry.radius_px; center=(geometry.center_rc[1],geometry.center_rc[0])
+            if mode=="polar":
+                for fraction in (self.current_viewer_config.homogeneity_inner_radius_fraction,self.current_viewer_config.homogeneity_outer_radius_fraction):
+                    arc=Circle(center,fraction*radius,fill=False,edgecolor="red",linewidth=2.2,zorder=21); self.ax_image.add_patch(arc); self.homogeneity_hover_artists.append(arc)
+                for phi in (np.radians(s.start_angle_deg or 0.0),np.radians(s.end_angle_deg or 0.0)):
+                    line=self.ax_image.plot([center[0]+self.current_viewer_config.homogeneity_inner_radius_fraction*radius*np.cos(phi),center[0]+self.current_viewer_config.homogeneity_outer_radius_fraction*radius*np.cos(phi)],[center[1]+self.current_viewer_config.homogeneity_inner_radius_fraction*radius*np.sin(phi),center[1]+self.current_viewer_config.homogeneity_outer_radius_fraction*radius*np.sin(phi)],color="red",linewidth=2.2,zorder=21)[0]; self.homogeneity_hover_artists.append(line)
+            else:
+                self.radial_hover_patch.set_center(center)
+                self.radial_hover_patch.set_radius(s.outer * radius)
+                self.radial_hover_patch.set_width((s.outer-s.inner) * radius)
+                self.radial_hover_patch.set_visible(True)
+            self.fig.canvas.draw_idle()
 
     def _on_button_release(self, _event: MouseEvent) -> None:
+        if not hasattr(_event, "inaxes"):
+            return
         if self._slider_change_pending:
             self._commit_current_controls()
+
+    def _on_resize(self, _event: Any) -> None:
+        """Reposition axes only; never forward a ResizeEvent to widgets."""
+
+        if self._closed:
+            return
+        self._layout_right_panel_for_group()
+        # The graph axes use figure coordinates and remain independent of the
+        # control figure.  Redraw both canvases without synthetic mouse events.
+        self.fig.canvas.draw_idle()
+        if self.graph_fig is not None:
+            self.graph_fig.canvas.draw_idle()
 
     def _stop_debounce(self) -> None:
         if self._debounce_timer is not None:
             self._debounce_timer.stop()
 
     def _schedule_analysis(self, *, immediate: bool = False) -> None:
+        if not self.image_paths:
+            self._show_no_data_state()
+            return
         validation = self.adapter.validate_config(
             self._committed_viewer_config, self.image_paths[self.index]
         )
@@ -3564,7 +4306,7 @@ class DiagnosticViewer:
         self._update_status()
 
     def _submit_analysis(self, config: Any | None = None) -> None:
-        if self._closed:
+        if self._closed or not self.image_paths:
             return
         generation = self._expected_generation
         path = self.image_paths[self.index]
@@ -3641,20 +4383,6 @@ class DiagnosticViewer:
             )
         else:
             return
-        if self.current_group == "Coverage homogeneity" and self.current_result is not None:
-            provider = getattr(self.adapter, "homogeneity_data", None)
-            if callable(provider):
-                items = provider(self.current_result, self._roi_selection, self.current_viewer_config)
-                layers = list(overlay.boundary_layers)
-                for item in items:
-                    segments = item.rings if self.current_viewer_config.homogeneity_view_mode == "radial" else item.sectors
-                    for segment in segments:
-                        if self.current_viewer_config.homogeneity_view_mode == "radial":
-                            mask=(item.r_over_R >= segment.inner)&(item.r_over_R <= segment.outer)
-                        else:
-                            mask=(item.r_over_R >= self.current_viewer_config.homogeneity_inner_radius_fraction)&(item.r_over_R <= self.current_viewer_config.homogeneity_outer_radius_fraction)&(item.phi_rad>=segment.inner)&(item.phi_rad<=segment.outer)
-                        layers.append(BoundaryLayer("Homogeneity boundaries", find_boundaries(mask, mode="outer"), (0.1,0.9,1.0,0.85) if segment.valid else (0.5,0.5,0.5,0.7)))
-                overlay = replace(overlay, boundary_layers=tuple(layers))
         image_shape = pixels.shape[:2]
         reset_view = (
             self._reset_view_on_next_result
@@ -3673,9 +4401,151 @@ class DiagnosticViewer:
             self.current_preview,
         )
         self._render_overlays()
+        self._update_homogeneity_artists()
+        self._update_local_geometry_artists()
+        self._update_local_coverage_map()
         self._update_cap_graph()
         self._update_status()
         self.fig.canvas.draw_idle()
+
+    def _clear_homogeneity_artists(self) -> None:
+        for artist in self.homogeneity_artists + self.homogeneity_hover_artists:
+            try: artist.remove()
+            except (ValueError, NotImplementedError): pass
+        self.homogeneity_artists.clear(); self.homogeneity_hover_artists.clear()
+        if self.homogeneity_info_text is not None:
+            self.homogeneity_info_text.set_visible(False)
+
+    def _clear_geometry_artists(self, artists: list[Any]) -> None:
+        for artist in artists:
+            try:
+                artist.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        artists.clear()
+
+    def _update_local_geometry_artists(self) -> None:
+        """Draw optional inscribed-circle and joint-grid geometry on the image."""
+
+        self._clear_geometry_artists(self.inscribed_geometry_artists)
+        self._clear_geometry_artists(self.local_geometry_artists)
+        if self.current_result is None or not isinstance(self.adapter, CoverageDiagnosticAdapter):
+            return
+        rois = self.adapter._selected_rois(self.current_result, self._roi_selection)
+        if self._roi_selection is None:
+            rois = [roi for roi in rois if _include_roi_in_global_summary(roi, self.current_viewer_config)]
+        for roi in rois:
+            geometry = self.adapter._sphere_geometry(roi, self.current_viewer_config)
+            center = (geometry.center_rc[1], geometry.center_rc[0])
+            inscribed = self.adapter.inscribed_circle_geometry(roi)
+            inscribed_center = (inscribed.center_rc[1], inscribed.center_rc[0])
+            if self.overlay_state.get("Inscribed circle", False):
+                circle = Circle(inscribed_center, inscribed.radius_px, fill=False, edgecolor="#00d9ff", linewidth=2.6 if geometry.mode == "max_inscribed_circle" else 2.0, linestyle="-.", zorder=16)
+                self.ax_image.add_patch(circle); self.inscribed_geometry_artists.append(circle)
+                marker = self.ax_image.plot([inscribed_center[0]], [inscribed_center[1]], marker="+", color="#00d9ff", markersize=10, markeredgewidth=2, zorder=17)[0]
+                self.inscribed_geometry_artists.append(marker)
+                diameter = Line2D(
+                    [inscribed_center[0] - inscribed.radius_px, inscribed_center[0] + inscribed.radius_px],
+                    [inscribed_center[1], inscribed_center[1]], color="#00d9ff", linewidth=1.6, zorder=17,
+                )
+                self.ax_image.add_line(diameter); self.inscribed_geometry_artists.append(diameter)
+                pixel_size = self.current_result.metadata.mean_pixel_size_m
+                diameter_m = 2.0 * inscribed.radius_px * pixel_size if pixel_size else None
+                label = self.ax_image.text(
+                    inscribed_center[0], inscribed_center[1] - inscribed.radius_px - 7,
+                    f"d_ins = {_format_coverage_length_m(diameter_m)}" if diameter_m else f"d_ins = {2.0 * inscribed.radius_px:.1f} px",
+                    color="#00d9ff", fontsize=7, ha="center", va="bottom",
+                    bbox={"facecolor": (0.0, 0.0, 0.0, .45), "edgecolor": "none", "pad": 1.2}, zorder=17,
+                )
+                self.inscribed_geometry_artists.append(label)
+            if self.current_group != "Coverage local heterogeneity" or not self.current_viewer_config.local_heterogeneity_enabled:
+                continue
+            inner = self.current_viewer_config.local_heterogeneity_inner_radius_fraction * geometry.radius_px
+            outer = self.current_viewer_config.local_heterogeneity_outer_radius_fraction * geometry.radius_px
+            if self.overlay_state.get("Local heterogeneity radial bands", True):
+                bands = self.current_viewer_config.local_heterogeneity_radial_band_count
+                for radius in np.linspace(inner, outer, bands + 1):
+                    circle = Circle(center, radius, fill=False, edgecolor="#ff4040", linewidth=1.25, zorder=14)
+                    self.ax_image.add_patch(circle); self.local_geometry_artists.append(circle)
+            if self.overlay_state.get("Local heterogeneity polar sectors", True):
+                sectors = self.current_viewer_config.local_heterogeneity_polar_sector_count
+                offset = np.radians(self.current_viewer_config.local_heterogeneity_display_rotation_deg % 360.0)
+                for angle in offset + np.linspace(0.0, 2.0 * np.pi, sectors, endpoint=False):
+                    line = self.ax_image.plot(
+                        [center[0] + inner * np.cos(angle), center[0] + outer * np.cos(angle)],
+                        [center[1] + inner * np.sin(angle), center[1] + outer * np.sin(angle)],
+                        color="#42ff79", linewidth=1.1, zorder=14,
+                    )[0]
+                    self.local_geometry_artists.append(line)
+
+    def _update_local_coverage_map(self) -> None:
+        """Render one transparent per-pixel local-grid map from cached results."""
+
+        visible = (
+            self.current_group == "Coverage local heterogeneity"
+            and self.current_result is not None
+            and self.current_viewer_config.local_heterogeneity_enabled
+            and self.overlay_state.get("Local heterogeneity coverage map", False)
+            and isinstance(self.adapter, CoverageDiagnosticAdapter)
+        )
+        if not visible:
+            self.local_coverage_artist.set_visible(False)
+            return
+        rois = self.adapter._selected_rois(self.current_result, self._roi_selection)
+        if self._roi_selection is None:
+            rois = [roi for roi in rois if _include_roi_in_global_summary(roi, self.current_viewer_config)]
+        grids = self.adapter.local_heterogeneity_data(self.current_result, self._roi_selection, self.current_viewer_config)
+        if not grids:
+            self.local_coverage_artist.set_visible(False); return
+        all_values = np.concatenate([grid.values[np.isfinite(grid.values)] for grid in grids if np.isfinite(grid.values).any()]) if any(np.isfinite(grid.values).any() for grid in grids) else np.array([])
+        if not all_values.size:
+            self.local_coverage_artist.set_visible(False); return
+        lo, hi = float(all_values.min()), float(all_values.max())
+        if hi <= lo: hi = lo + 1e-12
+        rgba = np.zeros((*self.current_result.display.shape, 4), dtype=np.float32)
+        cmap = plt.get_cmap("viridis")
+        for roi, grid in zip(rois, grids):
+            radial, sectors, in_domain = local_grid_index_maps(grid)
+            values = grid.values[radial, sectors]
+            domain = roi.bead_mask & in_domain & np.isfinite(values)
+            colors = cmap(np.clip((values - lo) / (hi - lo), 0, 1))
+            rgba[domain] = colors[domain]
+            rgba[..., 3][domain] = .38
+        self.local_coverage_artist.set_data(rgba)
+        self.local_coverage_artist.set_visible(True)
+
+    def _update_homogeneity_artists(self) -> None:
+        """Draw dedicated ring/sector geometry only in the homogeneity group."""
+        self._clear_homogeneity_artists()
+        if not (self.current_group == "Coverage homogeneity (legacy)" and self.current_result is not None and getattr(self.current_viewer_config, "coverage_homogeneity_enabled", False)):
+            return
+        provider=getattr(self.adapter,"homogeneity_data",None); select=getattr(self.adapter,"_selected_rois",None)
+        if not callable(provider) or not callable(select): return
+        items=provider(self.current_result,self._roi_selection,self.current_viewer_config)
+        rois=select(self.current_result,self._roi_selection)
+        if self._roi_selection is None:
+            include=getattr(self.adapter,"_coverage_status",None)
+            rois=[roi for roi in rois if include is None or not str(include(roi,self.current_viewer_config)).startswith("excluded")]
+        mode=self.current_viewer_config.homogeneity_view_mode
+        color="red" if mode=="radial" else "lime"
+        for roi,item in zip(rois,items):
+            geometry=self.adapter._sphere_geometry(roi, self.current_viewer_config)
+            radius=geometry.radius_px
+            center=(geometry.center_rc[1],geometry.center_rc[0])
+            if mode=="radial":
+                fractions=[item.rings[0].inner]+[ring.outer for ring in item.rings] if item.rings else []
+                for fraction in fractions:
+                    circle=Circle(center,fraction*radius,fill=False,edgecolor=color,linewidth=1.8,zorder=12); self.ax_image.add_patch(circle); self.homogeneity_artists.append(circle)
+            else:
+                inner=self.current_viewer_config.homogeneity_inner_radius_fraction*radius; outer=self.current_viewer_config.homogeneity_outer_radius_fraction*radius
+                for rr in (inner,outer):
+                    circle=Circle(center,rr,fill=False,edgecolor=color,linewidth=1.8,zorder=12); self.ax_image.add_patch(circle); self.homogeneity_artists.append(circle)
+                for segment in item.sectors:
+                    for phi in (np.radians(segment.start_angle_deg or 0.0),):
+                        x=[center[0]+inner*np.cos(phi),center[0]+outer*np.cos(phi)]; y=[center[1]+inner*np.sin(phi),center[1]+outer*np.sin(phi)]
+                        line=self.ax_image.plot(x,y,color=color,linewidth=1.5,zorder=12)[0]; self.homogeneity_artists.append(line)
+        text=(f"ring width = {self.current_viewer_config.radial_ring_width_fraction:.2f} R" if mode=="radial" else f"{self.current_viewer_config.polar_sector_count} sectors\nradial range = {self.current_viewer_config.homogeneity_inner_radius_fraction:.2f}–{self.current_viewer_config.homogeneity_outer_radius_fraction:.2f} R")
+        self.homogeneity_info_text=self.ax_image.text(.02,.04,text,transform=self.ax_image.transAxes,color="white",fontsize=8,bbox={"facecolor":"black","alpha":.55,"pad":2},zorder=13)
 
     def _update_cap_graph(self) -> None:
         """Render coverage-cap curves without submitting a production analysis."""
@@ -3683,8 +4553,98 @@ class DiagnosticViewer:
         axis = self.cap_graph_axis
         if axis is None:
             return
-        if self.current_group == "Coverage homogeneity" and self.current_result is not None:
+        for local_axis in (self.graph_heatmap_axis, self.graph_polar_axis, self.graph_radial_axis, self.graph_summary_axis, self.graph_colorbar_axis):
+            if local_axis is not None:
+                local_axis.clear()
+                local_axis.set_visible(False)
+        if self.current_group == "Coverage local heterogeneity" and self.current_result is not None:
+            axis.set_visible(False)
+            provider = getattr(self.adapter, "local_heterogeneity_data", None)
+            items = provider(self.current_result, self._roi_selection, self.current_viewer_config) if callable(provider) else []
+            if not items or not self.current_viewer_config.local_heterogeneity_enabled:
+                self.graph_main_axis.set_visible(True)
+                self.graph_main_axis.clear()
+                self.graph_main_axis.text(.5, .5, "Local heterogeneity is disabled or no included ROI is available", transform=self.graph_main_axis.transAxes, ha="center", va="center")
+                return
+            values = np.asarray([item.values for item in items], dtype=float)
+            matrix = np.nanmean(values, axis=0)
+            finite_values = values[np.isfinite(values)]
+            color_lo = float(finite_values.min()) if finite_values.size else 0.0
+            color_hi = float(finite_values.max()) if finite_values.size else 1.0
+            if color_hi <= color_lo:
+                color_hi = color_lo + 1e-12
+            first = items[0]
+            heatmap_axis = self.graph_heatmap_axis
+            polar_axis = self.graph_polar_axis
+            radial_axis = self.graph_radial_axis
+            summary_axis = self.graph_summary_axis
+            colorbar_axis = self.graph_colorbar_axis
+            show_heatmap = self.current_viewer_config.local_heterogeneity_show_heatmap
+            show_profiles = self.current_viewer_config.local_heterogeneity_show_1d_profiles
+            if not show_heatmap and not show_profiles:
+                self.graph_main_axis.set_visible(True); self.graph_main_axis.clear()
+                self.graph_main_axis.text(.5,.5,"Enable a heatmap and/or 1D profiles to display local heterogeneity.", transform=self.graph_main_axis.transAxes, ha="center", va="center")
+                return
+            # These are figure-level GridSpec axes, not inset axes.  Repositioning
+            # them for the three display combinations keeps the graph window
+            # useful without creating axes outside their parent.
+            if show_heatmap and show_profiles:
+                heatmap_axis.set_position([.07, .15, .62, .52])
+                polar_axis.set_position([.07, .75, .62, .18])
+                radial_axis.set_position([.74, .15, .16, .52])
+                summary_axis.set_position([.74, .75, .16, .18])
+                colorbar_axis.set_position([.92, .15, .025, .52])
+            elif show_heatmap:
+                heatmap_axis.set_position([.08, .15, .78, .70])
+                summary_axis.set_position([.08, .87, .78, .07])
+                colorbar_axis.set_position([.89, .15, .03, .70])
+            else:
+                polar_axis.set_position([.09, .56, .80, .31])
+                radial_axis.set_position([.09, .16, .80, .31])
+                summary_axis.set_position([.09, .89, .80, .06])
+            heatmap_axis.set_visible(show_heatmap)
+            colorbar_axis.set_visible(show_heatmap)
+            polar_axis.set_visible(show_profiles)
+            radial_axis.set_visible(show_profiles)
+            summary_axis.set_visible(True)
+            if show_heatmap:
+                image = heatmap_axis.imshow(
+                    matrix * 100.0, origin="lower", aspect="auto", interpolation="nearest",
+                    extent=(first.sector_edges_deg[0], first.sector_edges_deg[-1], first.radial_edges[0], first.radial_edges[-1]),
+                    cmap="viridis", vmin=color_lo * 100.0, vmax=color_hi * 100.0,
+                )
+                self.local_graph_hover_artist = Rectangle((0, 0), 0, 0, fill=False, edgecolor="#ff3030", linewidth=2.0, visible=False, zorder=20)
+                heatmap_axis.add_patch(self.local_graph_hover_artist)
+                heatmap_axis.set(title="Joint local coverage heterogeneity", xlabel="Azimuth angle, φ [°]", ylabel="Normalized radius, r/R")
+                heatmap_axis.set_xlim(0, 360); heatmap_axis.set_xticks(np.arange(0, 361, 60))
+            else:
+                self.local_graph_hover_artist = None
+            if show_heatmap:
+                self.graph_fig.colorbar(image, cax=colorbar_axis).set_label(f"{self.current_viewer_config.selected_cap_coverage_metric} [%]")
+            radial = np.nanmean(np.asarray([item.radial_profile for item in items]) * 100.0, axis=0)
+            polar = np.nanmean(np.asarray([item.polar_profile for item in items]) * 100.0, axis=0)
+            if show_profiles:
+                radial_axis.plot(radial, (first.radial_edges[:-1] + first.radial_edges[1:]) / 2.0, "o-", color="tab:red")
+                radial_axis.set(title="Radial", xlabel="%", ylabel="r/R"); radial_axis.tick_params(labelsize=7)
+                polar_axis.plot((first.sector_edges_deg[:-1] + first.sector_edges_deg[1:]) / 2.0, polar, "o-", color="tab:green")
+                polar_axis.set(title="Polar", xlabel="φ [°]", ylabel="%"); polar_axis.set_xlim(0, 360); polar_axis.tick_params(labelsize=7)
+                self.local_radial_hover_artist = radial_axis.plot([], [], "o", color="red", markersize=8, visible=False, zorder=20)[0]
+                self.local_polar_hover_artist = polar_axis.plot([], [], "o", color="red", markersize=8, visible=False, zorder=20)[0]
+            summary_axis.axis("off")
+            summary_axis.text(.02, .95, f"Metric: {self.current_viewer_config.selected_cap_coverage_metric}\nCoverage branch: {_coverage_branch_label(self.current_viewer_config)}\nValid grid cells: {int(np.isfinite(matrix).sum())}/{matrix.size}", va="top", fontsize=9)
+            if self.graph_status_text is not None:
+                total = [item.total_weighted_sd_pp for item in items if item.total_weighted_sd_pp is not None]
+                residual = [item.residual_weighted_sd_pp for item in items if item.residual_weighted_sd_pp is not None]
+                self.graph_status_text.set_text(
+                    f"Joint grid | total local SD: {np.mean(total):.3f} pp | residual SD: {np.mean(residual):.3f} pp"
+                    if total and residual else "Joint grid: insufficient valid cells"
+                )
+            if self.graph_fig is not None:
+                self.graph_fig.canvas.draw_idle()
+            return
+        if self.current_group == "Coverage homogeneity (legacy)" and self.current_result is not None:
             axis.set_visible(True); axis.clear()
+            self.homogeneity_graph_hover_artist = None
             provider = getattr(self.adapter, "homogeneity_data", None)
             items = provider(self.current_result, self._roi_selection, self.current_viewer_config) if callable(provider) else []
             if not items:
@@ -3692,14 +4652,22 @@ class DiagnosticViewer:
             mode=getattr(self.current_viewer_config,"homogeneity_view_mode","radial")
             profiles=[item.rings if mode=="radial" else item.sectors for item in items]
             x=np.asarray([segment.center for segment in profiles[0]],float)
-            if mode=="polar": x=np.degrees(x)
+            if mode=="polar":
+                x=np.asarray([((segment.start_angle_deg or 0.0) + (((segment.end_angle_deg or 0.0) - (segment.start_angle_deg or 0.0)) % 360.0) / 2.0) % 360.0 for segment in profiles[0]],float)
             metric=self.current_viewer_config.selected_cap_coverage_metric
             values=np.asarray([[np.nan if getattr(segment,metric) is None else getattr(segment,metric)*100 for segment in profile] for profile in profiles])
             mean=np.nanmean(values,axis=0); axis.plot(x,mean,"o-" if mode=="radial" else "o-",color="tab:blue")
             if values.shape[0]>1: axis.fill_between(x,mean-np.nanstd(values,axis=0),mean+np.nanstd(values,axis=0),alpha=.18)
             invalid=np.all(np.isnan(values),axis=0)
             if invalid.any(): axis.scatter(x[invalid],np.zeros(invalid.sum()),marker="x",color="red")
-            axis.set(title="Radial homogeneity" if mode=="radial" else "Polar homogeneity",xlabel="Normalized radius, r/R" if mode=="radial" else "Azimuth [deg]",ylabel="Coverage metric [%]"); axis.grid(alpha=.25); axis.tick_params(labelsize=6)
+            axis.set(title="Radial coverage homogeneity" if mode=="radial" else "Polar coverage homogeneity",xlabel="Normalized radius, r/R" if mode=="radial" else "Azimuth angle, φ [°]",ylabel="Coverage [%]"); axis.grid(alpha=.25); axis.tick_params(labelsize=9)
+            axis.title.set_fontsize(12); axis.xaxis.label.set_size(10); axis.yaxis.label.set_size(10)
+            if mode=="polar": axis.set_xlim(0,360); axis.set_xticks(np.arange(0,361,60))
+            self._ensure_homogeneity_graph_hover_artist()
+            if self.graph_status_text is not None:
+                self.graph_status_text.set_text("Legacy separate radial/polar homogeneity workflow")
+            if self.graph_fig is not None:
+                self.graph_fig.canvas.draw_idle()
             return
         provider = getattr(self.adapter, "cap_graph_data", None)
         visible = (
@@ -3736,12 +4704,18 @@ class DiagnosticViewer:
             if invalid.any():
                 axis.scatter(x[invalid], np.zeros(int(invalid.sum())), marker="x", color="red", label="Incomplete cap")
         axis.axvline(float(self.current_viewer_config.coverage_cap_radius_fraction), color="red", linestyle="--", linewidth=1.0)
-        axis.set_xlabel("a/R" if mode == "cumulative" else "r/R", fontsize=7)
-        axis.set_ylabel("Metric [%]", fontsize=7)
-        axis.set_title("Cap coverage" if mode == "cumulative" else "Annular radial coverage", fontsize=8)
-        axis.tick_params(labelsize=6)
+        axis.set_xlabel("Cap radius fraction, a/R" if mode == "cumulative" else "Annulus-center radius, r/R", fontsize=10)
+        axis.set_ylabel("Coverage metric [%]", fontsize=10)
+        axis.set_title("Cap coverage" if mode == "cumulative" else "Annular radial coverage", fontsize=12)
+        axis.tick_params(labelsize=9)
         axis.grid(alpha=0.25)
-        axis.legend(fontsize=5.5, loc="best")
+        axis.legend(fontsize=8, loc="best")
+        if self.graph_status_text is not None:
+            self.graph_status_text.set_text(
+                f"Cap diagnostics | {_coverage_branch_label(self.current_viewer_config)}"
+            )
+        if self.graph_fig is not None:
+            self.graph_fig.canvas.draw_idle()
 
     def _render_overlays(self) -> None:
         show = (
@@ -4024,7 +4998,12 @@ class DiagnosticViewer:
         statuses = self.overlay_checks.get_status()
         self.overlay_state.update(zip(self.overlay_labels, map(bool, statuses)))
         self._render_overlays()
+        # These layers are deliberately independent of the overlay-stage
+        # BoundaryLayer machinery and must redraw immediately when toggled.
+        self._update_local_geometry_artists()
+        self._update_local_coverage_map()
         self._update_status()
+        self.fig.canvas.draw_idle()
 
     def set_overlay(self, label: str, visible: bool) -> None:
         """Set one overlay state, primarily for automation and tests."""
@@ -4043,6 +5022,9 @@ class DiagnosticViewer:
         self._navigate_image(1)
 
     def _navigate_image(self, step: int) -> None:
+        if not self.image_paths:
+            self._show_no_data_state()
+            return
         self.index = (self.index + step) % len(self.image_paths)
         self._roi_selection = None
         self._message = ""
@@ -4052,6 +5034,9 @@ class DiagnosticViewer:
         self._schedule_analysis(immediate=True)
 
     def first_image(self) -> None:
+        if not self.image_paths:
+            self._show_no_data_state()
+            return
         self.index = 0
         self._roi_selection = None
         self._reset_view_on_next_result = True
@@ -4059,6 +5044,9 @@ class DiagnosticViewer:
         self._schedule_analysis(immediate=True)
 
     def last_image(self) -> None:
+        if not self.image_paths:
+            self._show_no_data_state()
+            return
         self.index = len(self.image_paths) - 1
         self._roi_selection = None
         self._reset_view_on_next_result = True
@@ -4186,6 +5174,12 @@ class DiagnosticViewer:
         self._commit_current_controls()
 
     def save(self) -> None:
+        selected = choose_json_save_path(self.output_config, self.fig)
+        if selected is None:
+            self._message = "Save cancelled."
+            self._update_status()
+            return
+        self.output_config = selected.expanduser().resolve()
         same_path = self.output_config == self.config_path
         if same_path and not self._overwrite_confirmation_pending:
             self._overwrite_confirmation_pending = True
@@ -4197,13 +5191,17 @@ class DiagnosticViewer:
             return
         try:
             saved_path = save_tuned_config(
-                self.raw_source_config, self.current_viewer_config, self.output_config
+                self.raw_source_config, self.current_viewer_config, self.output_config,
+                effective_folder=self.folder,
+                effective_file=self.selected_file.name if self.selected_file is not None else None,
             )
             _saved_app_config, saved_viewer_config, _saved_raw = self.adapter.load_config(saved_path)
             if saved_viewer_config != self.current_viewer_config:
                 raise ValueError(
                     "Saved configuration does not round-trip to the current diagnostic settings."
                 )
+            if Path(_saved_app_config.folder).expanduser() != (self.folder or Path("")) or _saved_app_config.file != (self.selected_file.name if self.selected_file else None):
+                raise ValueError("Saved configuration does not preserve the effective data source.")
         except (OSError, TypeError, ValueError) as exc:
             LOGGER.exception("Failed to save tuned configuration")
             self._message = f"Save failed: {exc}"
@@ -4216,11 +5214,12 @@ class DiagnosticViewer:
     def reload(self) -> None:
         """Reload source config, image list, and the selected image from disk."""
 
-        selected = self.image_paths[self.index].resolve()
+        selected = self.image_paths[self.index].resolve() if self.image_paths else None
         try:
             app_config, viewer_config, raw = self.adapter.load_config(self.config_path)
-            folder = self.folder_override or Path(app_config.folder).expanduser()
-            image_paths = self.adapter.resolve_images(folder, app_config, self.selected_file)
+            folder = self.folder_override or (Path(app_config.folder).expanduser() if app_config.folder else None)
+            configured_file = self._cli_selected_file or (Path(app_config.file) if app_config.file else None)
+            image_paths = self.adapter.resolve_images(folder, app_config, configured_file) if folder is not None else []
         except (OSError, ValueError, KeyError) as exc:
             LOGGER.exception("Diagnostic reload failed")
             self._message = f"Reload failed: {exc}"
@@ -4232,10 +5231,11 @@ class DiagnosticViewer:
         self.current_viewer_config = viewer_config
         self.raw_source_config = raw
         self.folder = folder
+        self.selected_file = Path(image_paths[0].name) if configured_file is not None and image_paths else None
         self.image_paths = image_paths
         resolved = [path.resolve() for path in image_paths]
         self.index = resolved.index(selected) if selected in resolved else 0
-        validation = self.adapter.validate_config(viewer_config, self.image_paths[self.index])
+        validation = self.adapter.validate_config(viewer_config, self.image_paths[self.index] if self.image_paths else None)
         if validation:
             self._message = f"Reload failed: {validation}"
             self._update_status()
@@ -4266,7 +5266,11 @@ class DiagnosticViewer:
         self._stage_message = ""
         self._reset_view_on_next_result = True
         self._show_loading_preview()
-        self._schedule_analysis(immediate=True)
+        if self.image_paths:
+            self._schedule_analysis(immediate=True)
+        else:
+            self._data_message = "No data loaded. Use Load data to select an image or folder."
+            self._show_no_data_state()
 
     @property
     def has_unsaved_changes(self) -> bool:
@@ -4290,27 +5294,22 @@ class DiagnosticViewer:
         dirty = " | UNSAVED" if self.has_unsaved_changes else ""
         roi_label = self.adapter.format_roi_selection(self._roi_selection)
         roi_suffix = f" | {roi_label}" if roi_label else ""
-        self.fig.suptitle(
-            f"{self.adapter.mode_name} | {self.index + 1}/{len(self.image_paths)} | "
-            f"{self.image_paths[self.index].name} | {stage}{roi_suffix}{running}{dirty}",
-            fontsize=11,
-        )
-        if self.current_result is not None:
-            summary = self.adapter.summarize_result(
-                self.current_result,
-                self.current_duration_s,
-                self._roi_selection,
-                self.current_viewer_config,
-            )
-        elif self.current_error is not None:
-            summary = self.adapter.summarize_failed_preview(
-                self.current_preview,
-                self.current_error,
-                self.current_duration_s,
-                stage,
-            )
-        else:
-            summary = "No completed analysis yet."
+        try:
+            if self.current_result is not None:
+                summary = self.adapter.summarize_result(
+                    self.current_result, self.current_duration_s,
+                    self._roi_selection, self.current_viewer_config,
+                )
+            elif self.current_error is not None:
+                summary = self.adapter.summarize_failed_preview(
+                    self.current_preview, self.current_error,
+                    self.current_duration_s, stage,
+                )
+            else:
+                summary = "No completed analysis yet."
+        except Exception as exc:
+            LOGGER.exception("Status summary formatting failed")
+            summary = f"Status summary error: {type(exc).__name__}"
         timing_parts: list[str] = [f"State: {state_label}", f"Group: {self.current_group}"]
         if self.current_duration_s > 0:
             timing_parts.append(f"last analysis {self.current_duration_s:.2f} s")
@@ -4341,10 +5340,42 @@ class DiagnosticViewer:
         if self._message:
             details += f" | {self._message}"
         help_text = self._help_message or "Hover over a control for parameter help; H shows keys."
-        self.status_text.set_text(f"{summary}\n{details}\n{help_text}")
+        current_relative = self._relative_image_text(self.image_paths[self.index]) if self.image_paths else "no data"
+        source_title = f"{self.index + 1}/{len(self.image_paths)} | {current_relative}" if self.image_paths else "no data"
+        self.fig.suptitle(
+            f"{self.adapter.mode_name} | {source_title} | {stage}{roi_suffix}{running}{dirty}",
+            fontsize=11,
+        )
+        if self.graph_fig is not None:
+            self.graph_fig.suptitle(f"Source: {current_relative}", fontsize=9, x=0.07, ha="left")
+        if self.selected_file is not None:
+            data_text = f"Data: {current_relative}"
+        elif self.image_paths:
+            folder_count = len({path.parent for path in self.image_paths})
+            data_text = f"Data: {len(self.image_paths)} images in {folder_count} TIFF-containing folders under {self.folder}"
+        else:
+            data_text = "Data: none — use Load data"
+        self.status_text.set_text(f"{summary}\n{data_text} | {details}\n{help_text}")
         self.fig.canvas.draw_idle()
 
+    def _relative_image_text(self, path: Path) -> str:
+        """Return a concise source identity that remains unique under a root."""
+
+        if self.selected_file is not None:
+            return path.name
+        if self.folder is not None:
+            try:
+                return path.resolve().relative_to(self.folder.resolve()).as_posix()
+            except ValueError:
+                pass
+        return path.name
+
     def _on_close(self, _event: CloseEvent | None = None) -> None:
+        self.close()
+
+    def _on_graph_close(self, _event: CloseEvent | None = None) -> None:
+        """Close the shared controller when either synchronized window closes."""
+
         self.close()
 
     def close(self) -> None:
@@ -4362,10 +5393,49 @@ class DiagnosticViewer:
         self._disconnect_widget(self.overlay_checks, self._overlay_checks_callback_id)
         for button, callback_id in zip(self._buttons, self._button_callback_ids):
             self._disconnect_widget(button, callback_id)
-        for callback_id in self._canvas_callback_ids:
+        for callback_id in self._main_canvas_callback_ids:
             self.fig.canvas.mpl_disconnect(callback_id)
+        if self.graph_fig is not None:
+            for callback_id in self._graph_canvas_callback_ids:
+                self.graph_fig.canvas.mpl_disconnect(callback_id)
         self._release_canvas_mouse()
         self.controller.close()
+        self.current_result = None
+        self.current_preview = None
+        self.current_error = None
+        for cache_name in (
+            "_cap_graph_cache",
+            "_homogeneity_cache",
+            "_local_heterogeneity_cache",
+            "_local_heterogeneity_robust_cache",
+            "_inscribed_circle_cache",
+        ):
+            cache = getattr(self.adapter, cache_name, None)
+            if isinstance(cache, dict):
+                cache.clear()
+        if hasattr(self.adapter, "_local_heterogeneity_cache_result"):
+            self.adapter._local_heterogeneity_cache_result = None
+        # Closed figures can remain reachable briefly through test harnesses or
+        # GUI backend objects.  Drop their large image arrays immediately so a
+        # sequence of viewers cannot accumulate one full SEM-sized RGBA buffer
+        # per closed window while cyclic collection catches up.
+        for figure in (self.graph_fig, self.fig):
+            if figure is None:
+                continue
+            for axis in tuple(figure.axes):
+                for artist in tuple(axis.images):
+                    artist.set_data(np.zeros((1, 1), dtype=np.float32))
+            figure.clear()
+        if self.graph_fig is not None and plt.fignum_exists(self.graph_fig.number):
+            try:
+                plt.close(self.graph_fig)
+            except Exception:
+                LOGGER.debug("Could not close graph figure", exc_info=True)
+        if self.fig is not None and plt.fignum_exists(self.fig.number):
+            try:
+                plt.close(self.fig)
+            except Exception:
+                LOGGER.debug("Could not close main figure", exc_info=True)
 
     def show(self) -> None:
         """Display the Matplotlib window."""
@@ -4373,8 +5443,25 @@ class DiagnosticViewer:
         plt.show()
 
     def _load_initial_preview(self) -> np.ndarray | None:
+        if not self.image_paths:
+            return None
         image_path = self.image_paths[self.index]
         return self.adapter.initial_preview(image_path, self.current_viewer_config)
+
+    def _show_no_data_state(self) -> None:
+        """Keep both windows useful when analysis parameters have no input data."""
+        self.current_result = self.current_preview = None
+        self.current_error = None
+        image = self._make_placeholder_image()
+        self._set_main_image(image, reset_view=True)
+        self.loading_text.set_text("No data loaded.\nUse Load data to select an image or folder.")
+        self.loading_text.set_visible(True)
+        if self.graph_main_axis is not None:
+            self.graph_main_axis.clear(); self.graph_main_axis.set_visible(True)
+            self.graph_main_axis.text(.5, .5, "No data loaded.\nUse Load data in the main window.", transform=self.graph_main_axis.transAxes, ha="center", va="center")
+        if self.graph_fig is not None:
+            self.graph_fig.canvas.draw_idle()
+        self._update_status()
 
     def _make_placeholder_image(self, shape: tuple[int, int] = (256, 256)) -> np.ndarray:
         placeholder = np.full((*shape, 3), 0.12, dtype=np.float32)
@@ -4396,6 +5483,7 @@ class DiagnosticViewer:
         self.image_artist.set_data(array)
         self.image_artist.set_extent(extent)
         self.boundary_artist.set_extent(extent)
+        self.local_coverage_artist.set_extent(extent)
         self.ax_image.set_aspect("equal")
         self.ax_image.set_autoscale_on(False)
         if reset_view:

@@ -11,14 +11,34 @@ import math
 from typing import Optional, Sequence
 
 import numpy as np
+from scipy import ndimage as ndi
 
 
-SPHERE_DIAMETER_METRICS = ("mean_xy_diameter", "equivalent_diameter")
+SPHERE_DIAMETER_METRICS = (
+    "mean_xy_diameter",
+    "equivalent_diameter",
+    "max_inscribed_circle",
+)
 CAP_COVERAGE_METRICS = (
     "projected_fraction",
     "surface_weighted_fraction",
     "projected_over_cap_surface",
 )
+
+
+def equal_width_radial_intervals(
+    inner_fraction: float, outer_fraction: float, requested_width_fraction: float
+) -> tuple[tuple[tuple[float, float], ...], float]:
+    """Construct an exact, gap-free equal-width normalized radial partition."""
+
+    if not (0 <= inner_fraction < outer_fraction <= 1 and 0 < requested_width_fraction <= outer_fraction - inner_fraction):
+        raise ValueError("Radial interval fractions are invalid.")
+    count = max(1, int(round((outer_fraction - inner_fraction) / requested_width_fraction)))
+    effective = (outer_fraction - inner_fraction) / count
+    return tuple(
+        (inner_fraction + index * effective, inner_fraction + (index + 1) * effective)
+        for index in range(count)
+    ), float(effective)
 
 
 def normalize_sphere_diameter_metric(metric: str) -> str:
@@ -28,7 +48,7 @@ def normalize_sphere_diameter_metric(metric: str) -> str:
     if value not in SPHERE_DIAMETER_METRICS:
         raise ValueError(
             f"Unsupported sphere_diameter_metric {metric!r}. Supported values: "
-            "mean_xy_diameter, equivalent_diameter."
+            "mean_xy_diameter, equivalent_diameter, max_inscribed_circle."
         )
     return value
 
@@ -50,9 +70,72 @@ def sphere_diameter_px(
 ) -> float:
     """Return the cap-geometry sphere diameter from already measured ROI values."""
 
-    if normalize_sphere_diameter_metric(metric) == "equivalent_diameter":
+    selected = normalize_sphere_diameter_metric(metric)
+    if selected == "equivalent_diameter":
         return float(equivalent_diameter_px)
+    if selected == "max_inscribed_circle":
+        raise ValueError("max_inscribed_circle requires the bead mask geometry.")
     return float((x_diameter_px + y_diameter_px) / 2.0)
+
+
+@dataclass(frozen=True)
+class SphereGeometry:
+    """Sphere reference center/radius selected from an accepted bead mask."""
+
+    center_rc: tuple[float, float]
+    radius_px: float
+    mode: str
+    plateau_pixel_count: int = 1
+
+
+def maximum_inscribed_circle(bead_mask: np.ndarray) -> SphereGeometry:
+    """Find a deterministic maximum inscribed circle of a non-empty bead mask.
+
+    The Euclidean distance transform gives the distance to the nearest outside
+    pixel.  A tied maximum plateau is represented by its mean row/column so
+    repeated calls produce a stable center rather than choosing an arbitrary
+    first pixel.
+    """
+
+    mask = np.asarray(bead_mask, dtype=bool)
+    if mask.ndim != 2 or not mask.any():
+        raise ValueError("A non-empty two-dimensional bead mask is required.")
+    distance = ndi.distance_transform_edt(mask)
+    maximum = float(distance.max())
+    if not math.isfinite(maximum) or maximum <= 0:
+        raise ValueError("The bead mask has no positive inscribed-circle radius.")
+    plateau = np.isclose(distance, maximum, rtol=0.0, atol=1e-12) & mask
+    rows, cols = np.nonzero(plateau)
+    return SphereGeometry(
+        center_rc=(float(rows.mean()), float(cols.mean())),
+        radius_px=maximum,
+        mode="max_inscribed_circle",
+        plateau_pixel_count=int(rows.size),
+    )
+
+
+def sphere_geometry_from_mask(
+    bead_mask: np.ndarray,
+    *,
+    centroid_rc: tuple[float, float],
+    equivalent_diameter_px: float,
+    x_diameter_px: float,
+    y_diameter_px: float,
+    metric: str,
+) -> SphereGeometry:
+    """Resolve one diagnostic sphere geometry without invoking segmentation."""
+
+    selected = normalize_sphere_diameter_metric(metric)
+    if selected == "max_inscribed_circle":
+        return maximum_inscribed_circle(bead_mask)
+    diameter = sphere_diameter_px(
+        equivalent_diameter_px, x_diameter_px, y_diameter_px, selected
+    )
+    return SphereGeometry(
+        center_rc=(float(centroid_rc[0]), float(centroid_rc[1])),
+        radius_px=float(diameter / 2.0),
+        mode=selected,
+    )
 
 
 @dataclass(frozen=True)
@@ -98,6 +181,22 @@ class CoverageCapMetrics:
         """Return one explicitly selected cap metric without changing geometry."""
 
         return getattr(self, normalize_cap_coverage_metric(metric))
+
+
+@dataclass(frozen=True)
+class CapRadiusSensitivity:
+    """Methodological sensitivity of one cap metric to radius selection."""
+
+    metric: str
+    point_count: int
+    interval_low_fraction: float | None
+    interval_high_fraction: float | None
+    median_percent: float | None
+    q10_percent: float | None
+    q90_percent: float | None
+    q10_q90_half_width_pp: float | None
+    half_range_pp: float | None
+    slope_pp_per_R: float | None
 
 
 def nearest_mask_pixel(mask: np.ndarray, center_rc: tuple[float, float]) -> tuple[int, int]:
@@ -234,13 +333,58 @@ def cumulative_cap_sweep(
     ]
 
 
+def cap_sensitivity_fractions(
+    radius_fraction: float, half_width: float, step_fraction: float
+) -> tuple[float, ...]:
+    """Return a clipped sensitivity grid that always contains the fixed radius."""
+
+    if not (0 < radius_fraction <= 1 and 0 <= half_width < 1 and 0 < step_fraction <= 1):
+        raise ValueError("Cap sensitivity fractions are invalid.")
+    epsilon = np.finfo(float).eps
+    low = max(epsilon, radius_fraction - half_width)
+    high = min(1.0, radius_fraction + half_width)
+    values = list(np.arange(low, high + step_fraction * 0.5, step_fraction, dtype=float))
+    values.extend((low, high, radius_fraction))
+    return tuple(sorted({min(1.0, max(epsilon, float(value))) for value in values}))
+
+
+def summarize_cap_sensitivity(
+    metrics: Sequence[CoverageCapMetrics], metric: str
+) -> CapRadiusSensitivity:
+    """Summarize valid cumulative-cap points without calling their spread SD."""
+
+    metric = normalize_cap_coverage_metric(metric)
+    pairs = [
+        (item.geometry.radius_fraction, item.selected_value(metric))
+        for item in metrics
+        if item.valid and item.selected_value(metric) is not None
+    ]
+    if len(pairs) < 3:
+        return CapRadiusSensitivity(metric, len(pairs), None, None, None, None, None, None, None, None)
+    fractions = np.asarray([item[0] for item in pairs], dtype=float)
+    values = np.asarray([item[1] for item in pairs], dtype=float)
+    q10, median, q90 = (float(np.quantile(values, q)) * 100.0 for q in (.1, .5, .9))
+    slope = float(np.polyfit(fractions, values * 100.0, 1)[0]) if len(pairs) > 1 else None
+    return CapRadiusSensitivity(
+        metric=metric,
+        point_count=len(pairs),
+        interval_low_fraction=float(fractions.min()),
+        interval_high_fraction=float(fractions.max()),
+        median_percent=median,
+        q10_percent=q10,
+        q90_percent=q90,
+        q10_q90_half_width_pp=(q90 - q10) / 2.0,
+        half_range_pp=float((values.max() - values.min()) * 50.0),
+        slope_pp_per_R=slope,
+    )
+
+
 def annular_cap_profile(
     bead_mask: np.ndarray,
     ag_mask: np.ndarray,
     center_rc: tuple[float, float],
     sphere_radius_px: float,
-    *,
-    bins: int = 16,
+    *, width_fraction: float = 0.05, inner_fraction: float = 0.0, outer_fraction: float = 1.0, bins: int | None = None,
 ) -> list[dict[str, float | int | None]]:
     """Compute non-overlapping local radial cap metrics from existing masks."""
 
@@ -248,17 +392,19 @@ def annular_cap_profile(
     ag = np.asarray(ag_mask, dtype=bool)
     if bead.ndim != 2 or ag.shape != bead.shape or not bead.any() or sphere_radius_px <= 0:
         raise ValueError("Matching non-empty masks and a positive sphere radius are required.")
-    if bins < 1:
-        raise ValueError("Profile bins must be positive.")
+    if bins is not None:
+        width_fraction = (outer_fraction-inner_fraction) / bins
+    if not (0 < width_fraction <= outer_fraction-inner_fraction and 0 <= inner_fraction < outer_fraction <= 1):
+        raise ValueError("Annulus fractions are invalid.")
     anchor_row, anchor_col = nearest_mask_pixel(bead, center_rc)
     rows, cols = np.ogrid[: bead.shape[0], : bead.shape[1]]
     radial_sq = (rows - anchor_row) ** 2 + (cols - anchor_col) ** 2
     normalized = np.sqrt(radial_sq) / sphere_radius_px
     weights = sphere_radius_px / np.sqrt(np.maximum(sphere_radius_px**2 - radial_sq, 1e-12))
     output: list[dict[str, float | int | None]] = []
-    for index in range(bins):
-        low, high = index / bins, (index + 1) / bins
-        annulus = (normalized >= low) & ((normalized < high) if index < bins - 1 else (normalized <= high))
+    intervals, effective_width = equal_width_radial_intervals(inner_fraction, outer_fraction, width_fraction)
+    for index, (low, high) in enumerate(intervals):
+        annulus = (normalized >= low) & ((normalized < high) if index < len(intervals) - 1 else (normalized <= high))
         bead_region = annulus & bead
         ag_region = bead_region & ag
         bead_count = int(bead_region.sum())
@@ -272,6 +418,7 @@ def annular_cap_profile(
             "r_over_R_inner": low,
             "r_over_R_outer": high,
             "r_over_R_center": (low + high) / 2.0,
+            "effective_width_fraction": effective_width,
             "bead_pixel_count": bead_count,
             "ag_pixel_count": ag_count,
             "projected_fraction": float(ag_count / bead_count) if bead_count else None,

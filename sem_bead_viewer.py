@@ -100,9 +100,10 @@ class ViewerConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
-    folder: str
+    folder: str = ""
     viewer: ViewerConfig = ViewerConfig()
     summary_json_path: Optional[str] = None
+    file: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -291,7 +292,8 @@ def load_app_config(config_path: str | Path) -> AppConfig:
         ),
     )
     return AppConfig(
-        folder=data["folder"],
+        folder=str(data.get("folder") or ""),
+        file=data.get("file"),
         viewer=viewer,
         summary_json_path=data.get("summary_json_path"),
     )

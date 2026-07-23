@@ -5,6 +5,7 @@ __pycache__/
 .idea/
 .venv
 tests/
+AGENTS.md
 
 IACH_SEM
 Ag_na_PS_kuličkách/
@@ -12,3 +13,4 @@ sem_10kDa_1x_coverage_viewer_config.json
 sem_bead_viewer_config.json
 sem_coverage_viewer_config.json
 tem_particle_viewer_config.json
+130526*
