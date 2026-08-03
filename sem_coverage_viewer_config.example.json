@@ -16,6 +16,8 @@
       "bead_opening_radius": 3,
       "bead_hole_area": 5000,
       "ag_tophat_radius": 9,
+      "ag_mask_threshold_rel": 1.0,
+      "ag_opening_radius": 1,
       "ag_min_object_size": 5,
       "ag_erode_bead_radius": 2,
       "ag_use_log": false,

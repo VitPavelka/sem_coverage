@@ -28,7 +28,12 @@ from path_utils import (
     resolve_existing_input_path,
     resolve_optional_file_in_folder,
 )
-from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer, SegmentationError
+from sem_coverage import (
+    AnalyzerConfig,
+    SEMCoverageAnalyzer,
+    SegmentationError,
+    validate_analyzer_config,
+)
 from tabular_export import sort_paths
 from coverage_cap import (
     CAP_COVERAGE_METRICS,
@@ -198,6 +203,7 @@ class BeadCoverageResult:
     ag_peak_coords: np.ndarray
     ag_threshold: float
     ag_count_threshold: float
+    ag_peak_threshold: float
     ag_coverage_threshold: float
     coverage: float
     coverage_percent: float
@@ -328,6 +334,7 @@ def load_app_config(config_path: str | Path) -> CoverageAppConfig:
     if "display_percentiles" in analyzer_data:
         analyzer_data["display_percentiles"] = tuple(analyzer_data["display_percentiles"])
     analyzer = AnalyzerConfig(**analyzer_data) if analyzer_data else AnalyzerConfig()
+    validate_analyzer_config(analyzer)
     viewer_data["analyzer"] = analyzer
     viewer = CoverageViewerConfig(**viewer_data)
     viewer = replace(
@@ -926,11 +933,12 @@ def _build_roi_result(
     ag_mask, coverage_feat, coverage_thr = _segment_ag_coverage(analyzer, cropped, bead_mask, count_mask, count_feat, count_thr, config)
     legacy_coverage = analyzer._compute_coverage(bead_mask, ag_mask)
     projected_ag_count = analyzer._count_ag_peaks(count_feat, count_mask, count_thr)
+    peak_thr = float(count_thr) * float(analyzer.config.count_thr_rel)
     ag_peak_coords = peak_local_max(
         count_feat,
         labels=count_mask.astype(np.uint8),
         min_distance=int(analyzer.config.count_min_distance),
-        threshold_abs=float(count_thr) * float(analyzer.config.count_thr_rel),
+        threshold_abs=peak_thr,
         exclude_border=False,
     )
     bead_metrics = _measure_bead(
@@ -998,8 +1006,16 @@ def _build_roi_result(
         count_feature=count_feat,
         coverage_feature=coverage_feat,
         ag_peak_coords=ag_peak_coords,
+        # Backward-compatible alias: ag_threshold remains the effective
+        # threshold of the mask used for coverage.
         ag_threshold=float(coverage_thr),
+        # Effective primary Ag/count-mask threshold: Otsu multiplied by
+        # analyzer.ag_mask_threshold_rel.
         ag_count_threshold=float(count_thr),
+        # Effective local-maximum threshold. This does not segment either mask.
+        ag_peak_threshold=peak_thr,
+        # Effective independent secondary threshold when enabled; otherwise
+        # equal to the primary threshold because the primary mask is coverage.
         ag_coverage_threshold=float(coverage_thr),
         coverage=float(coverage),
         coverage_percent=float(coverage * 100.0),
@@ -1670,6 +1686,7 @@ def build_coverage_summary(
                     "sphere_np_density_per_um2": _safe_float(roi.sphere_np_density_per_um2),
                     "ag_threshold": _safe_float(roi.ag_threshold),
                     "ag_count_threshold": _safe_float(roi.ag_count_threshold),
+                    "ag_peak_threshold": _safe_float(roi.ag_peak_threshold),
                     "ag_coverage_threshold": _safe_float(roi.ag_coverage_threshold),
                     "bead_area_px": int(roi.bead_area_px),
                     "ag_area_px": int(roi.ag_area_px),
@@ -2284,8 +2301,13 @@ class CoverageDatasetViewer:
                     f"  Bead x/y: {_format_px_or_length(m.x_diameter_m, m.x_diameter_px)} / {_format_px_or_length(m.y_diameter_m, m.y_diameter_px)}",
                     f"  Bead anisotropy: {m.anisotropy_ratio:.3f}",
                     f"  Bead solidity: {m.solidity:.3f}",
-                    f"  Ag cov thr: {roi.ag_coverage_threshold:.4f}",
-                    f"  Ag count thr: {roi.ag_count_threshold:.4f}",
+                    f"  Ag primary mask thr: {roi.ag_count_threshold:.4f}",
+                    f"  Ag peak thr: {roi.ag_peak_threshold:.4f}",
+                    (
+                        f"  Ag secondary coverage thr: {roi.ag_coverage_threshold:.4f}"
+                        if self.config.ag_enable_secondary_coverage
+                        else "  Ag coverage mask: primary mask"
+                    ),
                     "",
                 ]
             )

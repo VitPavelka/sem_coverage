@@ -6,6 +6,7 @@ __pycache__/
 .venv
 tests/
 AGENTS.md
+Projects/
 
 IACH_SEM
 Ag_na_PS_kuličkách/

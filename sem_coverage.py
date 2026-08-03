@@ -73,16 +73,27 @@ class AnalyzerConfig:
 
 	# Ag segmentation (fast + robust defaults)
 	ag_tophat_radius: int = 7
+	ag_mask_threshold_rel: float = 1.0
+	ag_opening_radius: int = 1
 	ag_min_object_size: int = 5      # <<< important: 25 often deletes everything after stricter threshold
 	ag_erode_bead_radius: int = 2
 	ag_use_log: bool = True          # log1p compresses dynamic range (often helps)
 
 	# Counting via local maxima (fast alternative to watershed)
 	count_min_distance: int = 5  # px
-	count_thr_rel: float = 1.0   # threshold_abs = ag_threshold * count_thr_rel
+	count_thr_rel: float = 1.0   # peak threshold = effective primary-mask threshold * count_thr_rel
 
 	# Display
 	display_percentiles: Tuple[float, float] = (0.5, 99.5)
+
+
+def validate_analyzer_config(config: AnalyzerConfig) -> None:
+	"""Validate primary Ag-detector settings shared by every entry point."""
+
+	if not np.isfinite(config.ag_mask_threshold_rel) or config.ag_mask_threshold_rel <= 0:
+		raise ValueError("ag_mask_threshold_rel must be finite and greater than zero.")
+	if config.ag_opening_radius < 0:
+		raise ValueError("ag_opening_radius must be non-negative.")
 
 
 @dataclass
@@ -95,7 +106,8 @@ class AnalysisResult:
 	bead_mask: np.ndarray
 	ag_mask: np.ndarray
 	tophat: np.ndarray
-	ag_threshold: float
+	ag_threshold: float  # effective primary-mask threshold (Otsu * ag_mask_threshold_rel)
+	ag_peak_threshold: float
 	coverage: float
 	meta: dict[str, Any]
 
@@ -112,6 +124,7 @@ class SEMCoverageAnalyzer:
 	"""
 
 	def __init__(self, config: AnalyzerConfig = AnalyzerConfig(), logger: Optional[logging.Logger] = None):
+		validate_analyzer_config(config)
 		self.config = config
 		self.log = logger or logging.getLogger(__name__)
 
@@ -120,6 +133,9 @@ class SEMCoverageAnalyzer:
 		self._fp_bead_open = disk(self.config.bead_opening_radius)
 		self._fp_ag_roi_erode = disk(self.config.ag_erode_bead_radius) if self.config.ag_erode_bead_radius > 0 else None
 		self._fp_ag_tophat = disk(self.config.ag_tophat_radius)
+		self._fp_ag_opening = disk(self.config.ag_opening_radius) if self.config.ag_opening_radius > 0 else None
+		# The secondary coverage branch intentionally retains its independent,
+		# existing one-pixel opening.  It is not controlled by ag_opening_radius.
 		self._fp_open1 = disk(1)
 
 	# ---------- Public API ----------
@@ -138,6 +154,7 @@ class SEMCoverageAnalyzer:
 		cov = self._compute_coverage(bead_mask, ag_mask)
 
 		ag_count = self._count_ag_peaks(tophat, ag_mask, thr)
+		peak_thr = float(thr) * float(self.config.count_thr_rel)
 		# ag_areas = np.array([r.area for r in ag_regions], dtype=np.int32) if ag_regions else np.array([], dtype=np.int32)
 
 		meta = {
@@ -148,6 +165,8 @@ class SEMCoverageAnalyzer:
 			"bead_area_px": int(bead_mask.sum()),
 			"ag_area_px": int(ag_mask.sum()),
 			"ag_count": ag_count,
+			"ag_count_threshold": float(thr),
+			"ag_peak_threshold": peak_thr,
 		 	# "ag_area_mean": float(ag_areas.mean()) if ag_areas.size else 0.0,
 		 	# "ag_area_median": float(np.median(ag_areas)) if ag_areas.size else 0.0,
 			"config": self.config,
@@ -167,6 +186,7 @@ class SEMCoverageAnalyzer:
 			ag_mask=ag_mask,
 			tophat=tophat,
 			ag_threshold=float(thr),
+			ag_peak_threshold=peak_thr,
 			coverage=float(cov),
 			meta=meta,
 		)
@@ -220,7 +240,7 @@ class SEMCoverageAnalyzer:
 			res.tophat,
 			labels=res.ag_mask.astype(np.uint8),
 			min_distance=int(self.config.count_min_distance),
-			threshold_abs=float(res.ag_threshold) * float(self.config.count_thr_rel),
+			threshold_abs=float(res.ag_peak_threshold),
 			exclude_border=False,
 		)
 		if coords.size:
@@ -359,7 +379,10 @@ class SEMCoverageAnalyzer:
 		- Uses log1p optionally (dynamic range compression).
 		- Uses white top-hat with radius `ag_tophat_radius` (this is already a morphological
 		  background suppression for structures larger than the radius).
-		- Threshold is automatic (Otsu) computed ONLY within bead ROI.
+		- Computes Otsu only within the bead ROI and multiplies it by
+		  `ag_mask_threshold_rel`.
+		- Applies the configured opening, then enforces `ag_min_object_size` on
+		  the final primary mask.
 		"""
 		cfg = self.config
 		try:
@@ -382,23 +405,31 @@ class SEMCoverageAnalyzer:
 
 			# Otsu can fail if vals are constant (rare). Guard it.
 			if float(vals.max() - vals.min()) < 1e-12:
-				t = float(vals.max()) + 1e-6
+				base_t = float(vals.max()) + 1e-6
 			else:
-				t = float(threshold_otsu(vals))
+				base_t = float(threshold_otsu(vals))
+			t = base_t * float(cfg.ag_mask_threshold_rel)
 
 			ag = (feat > t) & roi
 
-			# skimage>=0.26: max_size removes <= max_size, so use -1 to mimic old "< min_size"
-			ag = remove_small_objects(ag, max_size=cfg.ag_min_object_size - 1)
-			ag = opening(ag, self._fp_open1)
+			if self._fp_ag_opening is not None:
+				ag = opening(ag, self._fp_ag_opening)
+			# Opening can split a component. Enforce the configured minimum on
+			# the final primary mask so no undersized fragment survives.
+			if cfg.ag_min_object_size > 1:
+				# skimage>=0.26: max_size removes <= max_size, so use -1 to
+				# preserve the historical "< min_size" definition.
+				ag = remove_small_objects(ag, max_size=cfg.ag_min_object_size - 1)
 
 			# extra debug stats (helps when something goes to zero)
 			p50 = float(np.percentile(vals, 50))
 			p90 = float(np.percentile(vals, 90))
 			p99 = float(np.percentile(vals, 99))
 			self.log.debug(
-				"Ag feat stats in ROI: min=%.6g p50=%.6g p90=%.6g p99=%.6g max=%.6g | thr=%.6g | ag_px=%d",
-				float(vals.min()), p50, p90, p99, float(vals.max()), float(t), int(ag.sum())
+				"Ag feat stats in ROI: min=%.6g p50=%.6g p90=%.6g p99=%.6g max=%.6g | "
+				"otsu=%.6g mask_rel=%.6g mask_thr=%.6g | ag_px=%d",
+				float(vals.min()), p50, p90, p99, float(vals.max()), float(base_t),
+				float(cfg.ag_mask_threshold_rel), float(t), int(ag.sum())
 			)
 
 			return ag, feat, float(t)
@@ -418,7 +449,9 @@ class SEMCoverageAnalyzer:
 		mask:
 			Boolean mask restricting where peaks are searched (e.g., ag_mask or ROI).
 		thr:
-			Base threshold (e.g., Otsu threshold) used to reject weak peaks.
+			Effective primary-mask threshold (Otsu multiplied by
+			``ag_mask_threshold_rel``). ``count_thr_rel`` is applied only here
+			to reject weak local maxima; it does not change the mask.
 
 		Returns
 		-------

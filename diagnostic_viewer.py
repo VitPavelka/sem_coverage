@@ -1582,6 +1582,30 @@ class CoverageDiagnosticAdapter:
                 config_paths=(("analyzer", "ag_tophat_radius"),),
             ),
             _spec(
+                "ag_mask_threshold_rel",
+                "Ag mask threshold multiplier",
+                "Ag count detector",
+                "float",
+                0.05,
+                5.0,
+                0.05,
+                "Multiplies the Otsu threshold that creates the primary Ag/count mask. "
+                "Increase for a more conservative mask; decrease for a more sensitive mask.",
+                config_paths=(("analyzer", "ag_mask_threshold_rel"),),
+            ),
+            _spec(
+                "ag_opening_radius",
+                "Ag opening radius",
+                "Ag count detector",
+                "int",
+                0,
+                20,
+                1,
+                "Morphological opening radius for the primary Ag/count mask. "
+                "Zero disables opening; larger values remove narrow protrusions and small structures.",
+                config_paths=(("analyzer", "ag_opening_radius"),),
+            ),
+            _spec(
                 "ag_min_object_size",
                 "Ag min object size",
                 "Ag count detector",
@@ -1589,7 +1613,8 @@ class CoverageDiagnosticAdapter:
                 1,
                 500,
                 1,
-                "Removes tiny objects from the Ag count mask. Increase to suppress noise; decrease when small Ag nanoparticles are missed.",
+                "Minimum connected-component area in the final primary Ag/count mask "
+                "after opening. Increase to suppress noise; decrease when small Ag nanoparticles are missed.",
                 config_paths=(("analyzer", "ag_min_object_size"),),
             ),
             _spec(
@@ -1627,13 +1652,15 @@ class CoverageDiagnosticAdapter:
             ),
             _spec(
                 "count_thr_rel",
-                "Count threshold multiplier",
+                "Ag peak threshold multiplier",
                 "Ag count detector",
                 "float",
                 0.05,
                 5.0,
                 0.05,
-                "Multiplier applied to the Ag peak threshold. Increase for stricter counting; decrease when weak particles are missed. This branch controls projected Ag count, count mask, count feature, and Ag peak markers.",
+                "Multiplies the effective primary-mask threshold only for local maxima "
+                "used by projected particle counting and Ag peak markers. It does not "
+                "change the primary mask or coverage mask.",
                 config_paths=(("analyzer", "count_thr_rel"),),
             ),
         ),
@@ -2031,10 +2058,17 @@ class CoverageDiagnosticAdapter:
             return "Split minimum child area ratio must be between 0 and 1."
         if analyzer.ag_tophat_radius < 1 or analyzer.ag_min_object_size < 1:
             return "Ag count radii and object-size limits must be positive."
+        if (
+            not math.isfinite(analyzer.ag_mask_threshold_rel)
+            or analyzer.ag_mask_threshold_rel <= 0
+        ):
+            return "Ag mask threshold multiplier must be finite and positive."
+        if analyzer.ag_opening_radius < 0:
+            return "Ag opening radius must be non-negative."
         if analyzer.ag_erode_bead_radius < 0 or analyzer.count_min_distance < 1:
             return "Ag count erosion radius must be non-negative and the peak spacing must be positive."
         if analyzer.count_thr_rel <= 0:
-            return "Ag count threshold multiplier must be positive."
+            return "Ag peak threshold multiplier must be positive."
         if config.ag_coverage_tophat_radius < 1:
             return "Coverage top-hat radius must be positive."
         if config.ag_coverage_tophat_radii is not None:
@@ -2637,6 +2671,11 @@ class CoverageDiagnosticAdapter:
                 f"cap C {selected_value * 100.0:.2f}% at {config.coverage_cap_radius_fraction:.2f} R"
                 if selected_value is not None else "cap C invalid"
             )
+            coverage_threshold_text = (
+                f"secondary cov thr {roi.ag_coverage_threshold:.4f}"
+                if config.ag_enable_secondary_coverage
+                else "coverage mask = primary mask"
+            )
             return (
                 f"ROI {roi.roi_index} | {self._coverage_status(roi, config)} | "
                 f"selected {cap_text if config.coverage_cap_enabled else f'legacy {roi.legacy_full_projected_coverage_percent:.2f}%'} | "
@@ -2648,8 +2687,9 @@ class CoverageDiagnosticAdapter:
                 f"bead/Ag cap px {cap.bead_pixel_count}/{cap.ag_pixel_count} | projected {roi.projected_ag_count} | "
                 f"sphere {roi.sphere_ag_count_est:.1f} | density {density} | "
                 f"eq {eq_text} | anisotropy {metrics.anisotropy_ratio:.3f} | "
-                f"solidity {metrics.solidity:.3f} | count thr {roi.ag_count_threshold:.4f} | "
-                f"cov thr {roi.ag_coverage_threshold:.4f} | bead px {roi.bead_area_px} | "
+                f"solidity {metrics.solidity:.3f} | primary count thr (mask) {roi.ag_count_threshold:.4f} | "
+                f"peak thr {roi.ag_peak_threshold:.4f} | "
+                f"{coverage_threshold_text} | bead px {roi.bead_area_px} | "
                 f"Ag px {roi.ag_area_px} | analysis {duration_s:.3f} s{pixel_text}"
                 f" | {coverage_branch}"
             )
