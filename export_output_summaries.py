@@ -160,6 +160,13 @@ def _canonical_coverage_identity(
         image_value = image.get("source_path") or image.get("file")
         source_path = _resolved_coverage_path(folder, image_value)
         sample_dir = source_path.parent
+    elif "source_path" in data:
+        explicit_source = data.get("source_path")
+        if explicit_source in (None, ""):
+            source_path = ""
+        else:
+            source_path = str(_resolved_coverage_path(folder, explicit_source))
+        sample_dir = folder
     elif selected_file:
         selected_path = _resolved_coverage_path(folder, selected_file)
         sample_dir = selected_path.parent

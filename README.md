@@ -175,6 +175,10 @@ This keeps existing working-directory-based setups working while allowing more p
 
 For `file` fields, an absolute file path is used directly. A relative file path is resolved inside the effective `folder`.
 
+Grouped coverage manifests use a separate path rule for `configs_root`: a
+relative `configs_root` is resolved next to the manifest itself. Paths inside
+each referenced coverage config retain the ordinary config rules above.
+
 ## 4. Recommended workflow
 
 1. **Diagnostic viewer**
@@ -334,16 +338,65 @@ Beads only:
 ```bat
 python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --outputs-dir "C:/Data/results_sem" --clean
 python batch_export_protocols.py --bead-root "C:/Data/SEM/size" --bead-config sem_bead_viewer_config.json --outputs-dir outputs
+python batch_export_protocols.py --bead-config sem_bead_viewer_config.json --outputs-dir outputs
 ```
 
-`--bead-config` selects the bead-analysis configuration template. It does not
-modify that source configuration file.
+`--bead-root` overrides the bead config's top-level `folder`. If it is omitted,
+an explicitly selected `--bead-config` supplies the input folder. The batch does
+not modify that source configuration file.
 
 Coverage only:
 
 ```bat
 python batch_export_protocols.py --coverage-root "C:/Data/SEM/coverage" --outputs-dir "C:/Data/results_sem" --clean
+python batch_export_protocols.py --coverage-config sem_coverage_viewer_config.json --outputs-dir outputs
+python batch_export_protocols.py --batch-config batch_export_protocols.example.json --outputs-dir outputs
 ```
+
+`--coverage-root` overrides the folder/file source in one ordinary
+`--coverage-config`. Without that override, the config's source is used.
+`--batch-config` is a distinct grouped mode and cannot be combined with either
+`--coverage-config` or `--coverage-root`.
+
+A grouped manifest is a JSON object whose top-level names are scientific sample
+identifiers. Each sample lists tuned coverage configs:
+
+```json
+{
+  "p1-b": {
+    "configs_root": "Projects/coverage_configs",
+    "config_names": ["p1-b1.json", "p1-b2"]
+  },
+  "p2-a": {
+    "configs_root": "Projects/coverage_configs",
+    "config_names": ["p2-a1.json"]
+  }
+}
+```
+
+Names with and without `.json` are accepted; no other filename guessing is
+performed. The full manifest is validated before image analysis. Within one
+scientific sample, assigning the same resolved TIFF through two configs is an
+error. For each requested coverage branch, all ROI records from the sample's
+tuned configs are pooled and the existing global-summary builder runs once on
+that complete ROI population; subconfig means are never averaged.
+
+The default `--coverage-branches configured` mode respects
+`ag_enable_secondary_coverage` in each individual coverage config. It does not
+create a branch directory: JSON and tables are written directly to
+`--outputs-dir`, and grouped overlays appear as
+`coverage_png/p1-b/<TIFF stem>.png`. Different tuned configs inside one
+scientific sample may therefore select one-layer or two-layer analysis
+individually while contributing to the same pooled summary.
+
+The explicit comparison modes `one-layer`, `two-layers`, and `both` override
+that config field and isolate their outputs under `coverage_one_layer/` and/or
+`coverage_two_layers/`. Tuned config names do not create extra directories.
+Colliding TIFF stems receive a deterministic readable suffix instead of being
+overwritten. Rich JSON image and ROI records include `analysis_config_name` and
+the resolved `analysis_config_path`. Group JSON also lists every distinct source
+path; its scalar `source_path` is empty when multiple sources exist. Compact
+CSV/XLSX schemas are unchanged.
 
 Both tasks:
 
@@ -356,6 +409,8 @@ Optional arguments:
 
 - `--bead-config FILE` - alternate bead-analysis template,
 - `--coverage-config FILE` - alternate coverage template,
+- `--batch-config FILE` - grouped scientific-sample manifest for multiple tuned coverage configs,
+- `--coverage-branches {configured,one-layer,two-layers,both}` - use each config's branch setting by default, or explicitly override it for comparisons,
 - `--clean` - remove previous JSON/CSV/PNG outputs in the target structure before running,
 - `--table-format {csv,xlsx,both,none}` - choose summary table output,
 - `--sort-by {name,path,none}` - control deterministic natural sorting,
@@ -477,6 +532,51 @@ python export_output_summaries.py --outputs-dir "C:/Data/results_sem" --table-fo
 Use this when SEM JSON files already exist and you want to regenerate CSV,
 XLSX, or histogram outputs later. The legacy `--no-csv`, `--no-bead-csv`,
 `--no-coverage-csv`, and `--no-histograms` switches remain available here.
+
+### 8.4 Extracting compact publication tables
+
+After CSV/XLSX export, create compact sibling tables recursively with:
+
+```bat
+python extract_output_tables.py "C:/Data/results_sem"
+```
+
+The defaults retain the existing `caps` coverage metric
+(`projected_over_cap_surface`) in the `homo` homogeneity-domain annulus. Both
+choices are configurable without changing code:
+
+```bat
+python extract_output_tables.py "C:/Data/results_sem" --coverage-metric surfw --region homo
+python extract_output_tables.py "C:/Data/results_sem" --coverage-metric caps --region cap
+```
+
+Recognized CSV files and recognized coverage worksheets are reduced to row
+identity/provenance, essential counts and validity fields, and the selected
+scientific family. For example,
+`coverage_global_summaries.csv` becomes
+`coverage_global_summaries-extracted.csv`, and
+`coverage_summaries.xlsx` becomes `coverage_summaries-extracted.xlsx`, next to
+the source. Source files are untouched. Rows are not aggregated, values are not
+rounded or recalculated, and no image analysis is run.
+
+The extractor skips unrelated tables, spreadsheet temporary files, and stems
+already ending in `-extracted`, so repeated recursive runs do not create
+`-extracted-extracted` files. Existing sibling outputs are skipped unless
+`--overwrite` is supplied. Use `--dry-run` to preview recognized tables and
+column-count reductions without writing anything; `--suffix` changes the
+sibling suffix. Add `--drop-medians` for an even smaller overview that removes
+only schema-classified descriptive population medians when the same table also
+retains the mean of that population. It is off by default. Rotation-robust
+polar/total/residual estimators, and medians without an equivalent mean, remain
+untouched.
+
+The current metric choices are `proj`, `caps`, and `surfw`; the current region
+choices are `cap` and `homo`. Local-cell, radial-profile, and polar-sector
+tables describe only the `homo` domain and are skipped for `--region cap`.
+The long-form Polar rotations table stores metric families in rows rather than
+columns, so it is explicitly omitted from an extracted workbook (or skipped as
+a standalone CSV) to keep this utility strictly column-selecting. Unrecognized
+workbook sheets are preserved unchanged.
 
 # 9. Configuration reference: `sem_bead_viewer_config.json`
 

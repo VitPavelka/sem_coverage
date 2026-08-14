@@ -1,0 +1,15 @@
+{
+  "sample-with-two-tuned-subsets": {
+    "configs_root": "example_configs",
+    "config_names": [
+      "sample-subset-1.json",
+      "sample-subset-2"
+    ]
+  },
+  "sample-with-one-config": {
+    "configs_root": "example_configs",
+    "config_names": [
+      "single-sample-config.json"
+    ]
+  }
+}

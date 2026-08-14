@@ -62,6 +62,9 @@ OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
 
 6) RUN BATCH EXPORTS FOR FINAL OUTPUTS
     python batch_export_protocols.py --bead-root "C:/Data/SEM beads" --outputs-dir outputs --table-format both
+    python batch_export_protocols.py --bead-config sem_bead_viewer_config.json --outputs-dir outputs
+    python batch_export_protocols.py --coverage-config sem_coverage_viewer_config.json --outputs-dir outputs
+    python batch_export_protocols.py --batch-config batch_export_protocols.example.json --outputs-dir outputs
     python batch_export_tem_protocols.py --root "C:/Data/TEM" --outputs-dir outputs_tem --table-format xlsx
     python export_output_summaries.py --outputs-dir outputs --table-format both
 
@@ -75,7 +78,25 @@ OPTION B - INSTALL FROM GITHUB (RECOMMENDED FOR UPDATES)
     --table-format both  writes both CSV and XLSX
     --table-format none  writes no summary tables
 
-7) UPDATE THE REPOSITORY SAFELY
+    Coverage defaults to --coverage-branches configured. Each coverage config's
+    ag_enable_secondary_coverage value chooses one-layer or two-layer analysis,
+    and outputs are written directly below outputs. Explicit one-layer,
+    two-layers, or both modes use separate coverage branch directories.
+
+7) OPTIONAL: EXTRACT COMPACT PUBLICATION TABLES
+    python extract_output_tables.py outputs
+    python extract_output_tables.py outputs --dry-run
+    python extract_output_tables.py outputs --drop-medians
+
+    This recursively writes sibling CSV/XLSX files ending in -extracted.
+    Defaults are coverage metric caps and homogeneity-domain region homo.
+    Use --coverage-metric and --region to change those existing families.
+    Source tables are untouched and values are only selected, never recalculated.
+    Previous -extracted files are ignored. Existing outputs require --overwrite.
+    --drop-medians is optional and removes only redundant descriptive medians;
+    robust rotation estimators remain in the compact scientific columns.
+
+8) UPDATE THE REPOSITORY SAFELY
     git status -sb
     git fetch origin
     git pull --ff-only

@@ -5,6 +5,9 @@ __pycache__/
 .idea/
 .venv
 tests/
+tests/
+tests/*
+!tests/test_batch_grouped_manifest.py
 AGENTS.md
 Projects/
 
@@ -15,3 +18,5 @@ sem_bead_viewer_config.json
 sem_coverage_viewer_config.json
 tem_particle_viewer_config.json
 130526*
+*.pdf
+*.zip

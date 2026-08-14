@@ -6,7 +6,7 @@ import json
 import logging
 import sys
 import tracemalloc
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable, Mapping
@@ -29,6 +29,7 @@ from export_output_summaries import export_outputs
 from path_utils import (
     coverage_sample_id,
     expand_user_path,
+    resolve_existing_input_path,
     resolve_optional_file_in_folder,
 )
 from coverage_cap import sphere_geometry_from_mask
@@ -80,6 +81,41 @@ class ResolvedCoverageSource:
     source_origin: str
 
 
+@dataclass(frozen=True)
+class ResolvedBeadSource:
+    """Bead input selected explicitly or inherited from the config."""
+
+    root: Path
+    source_origin: str
+
+
+@dataclass(frozen=True)
+class CoverageBatchAssignment:
+    """One validated tuned config and its canonical TIFF population."""
+
+    config_name: str
+    config_path: Path
+    app_config: Any
+    source: ResolvedCoverageSource
+    image_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class CoverageBatchGroup:
+    """One scientific sample assembled from one or more tuned configs."""
+
+    sample_id: str
+    assignments: tuple[CoverageBatchAssignment, ...]
+
+
+@dataclass(frozen=True)
+class CoverageBatchManifest:
+    """A completely preflighted grouped coverage manifest."""
+
+    path: Path
+    groups: tuple[CoverageBatchGroup, ...]
+
+
 def resolve_coverage_source(
     *,
     cli_root: Path | None,
@@ -96,11 +132,10 @@ def resolve_coverage_source(
     folder_text = str(getattr(app_config, "folder", "") or "").strip()
     if not folder_text:
         return None
-    configured_root = expand_user_path(folder_text)
-    root = (
-        configured_root
-        if configured_root.is_absolute()
-        else config_path.expanduser().resolve().parent / configured_root
+    root = resolve_existing_input_path(
+        folder_text,
+        config_path=config_path,
+        description="coverage source stored in config",
     ).resolve()
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"Coverage source stored in config does not exist: {root}")
@@ -112,6 +147,205 @@ def resolve_coverage_source(
             raise FileNotFoundError(f"Coverage source stored in config does not exist: {resolved}")
         return ResolvedCoverageSource(root, selected.resolve(), "config")
     return ResolvedCoverageSource(root, None, "config")
+
+
+def resolve_bead_source(
+    *,
+    cli_root: Path | None,
+    app_config: Any,
+    config_path: Path,
+) -> ResolvedBeadSource | None:
+    """Resolve bead input with the same CLI-override/config fallback contract."""
+
+    if cli_root is not None:
+        root = expand_user_path(cli_root).resolve()
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(
+                f"Bead source supplied by --bead-root does not exist: {root}"
+            )
+        return ResolvedBeadSource(root, "cli")
+    folder_text = str(getattr(app_config, "folder", "") or "").strip()
+    if not folder_text:
+        return None
+    root = resolve_existing_input_path(
+        folder_text,
+        config_path=config_path,
+        description="bead source stored in config",
+    ).resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(
+            f"Bead source stored in config is not a directory: {root}"
+        )
+    return ResolvedBeadSource(root, "config")
+
+
+def _coverage_source_image_paths(
+    source: ResolvedCoverageSource,
+    *,
+    sort_by: str = "name",
+) -> tuple[Path, ...]:
+    """Return the exact canonical TIFF population for one resolved source."""
+
+    if source.selected_file is not None:
+        return (source.selected_file.resolve(),)
+    paths: list[Path] = []
+    for sample_dir in _find_sample_dirs(source.root):
+        paths.extend(
+            sort_paths(
+                list(sample_dir.glob("*.tif")),
+                sort_by=sort_by,
+                root=source.root,
+            )
+        )
+    return tuple(path.resolve() for path in paths)
+
+
+def _resolve_manifest_config_path(configs_root: Path, config_name: str) -> Path:
+    """Resolve one explicit manifest config name without fuzzy guessing."""
+
+    name = config_name.strip()
+    if not name:
+        raise ValueError("Coverage config names must be non-empty strings.")
+    relative = Path(name)
+    if relative.is_absolute():
+        raise ValueError(
+            f"Coverage config name must be relative to configs_root: {config_name!r}."
+        )
+    if relative.suffix:
+        if relative.suffix.lower() != ".json":
+            raise ValueError(
+                f"Coverage config name must end in .json or omit the suffix: {config_name!r}."
+            )
+    else:
+        relative = relative.with_suffix(".json")
+    resolved = (configs_root / relative).resolve()
+    try:
+        resolved.relative_to(configs_root)
+    except ValueError:
+        raise ValueError(
+            f"Coverage config name escapes configs_root: {config_name!r}."
+        ) from None
+    return resolved
+
+
+def load_coverage_batch_manifest(
+    manifest_path: str | Path,
+    *,
+    sort_by: str = "name",
+) -> CoverageBatchManifest:
+    """Load and completely preflight a grouped coverage manifest.
+
+    This performs no image analysis.  Every config, source, TIFF assignment,
+    duplicate constraint, and output group identity is validated before the
+    caller creates or cleans output directories.
+    """
+
+    path = expand_user_path(manifest_path).resolve()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Coverage batch manifest not found: '{path}'.") from None
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Malformed JSON in coverage batch manifest '{path}' at line "
+            f"{exc.lineno}, column {exc.colno}."
+        ) from exc
+    if not isinstance(data, dict) or not data:
+        raise ValueError(
+            "Coverage batch manifest must be a non-empty JSON object keyed by scientific sample ID."
+        )
+
+    groups: list[CoverageBatchGroup] = []
+    safe_group_ids: dict[str, str] = {}
+    for raw_sample_id, raw_group in data.items():
+        if not isinstance(raw_sample_id, str) or not raw_sample_id.strip():
+            raise ValueError("Coverage batch scientific sample IDs must be non-empty strings.")
+        sample_id = raw_sample_id.strip()
+        safe_id = _safe_name(sample_id)
+        prior_id = safe_group_ids.get(safe_id.casefold())
+        if prior_id is not None:
+            raise ValueError(
+                f"Scientific sample IDs {prior_id!r} and {sample_id!r} map to the same output name {safe_id!r}."
+            )
+        safe_group_ids[safe_id.casefold()] = sample_id
+        if not isinstance(raw_group, dict):
+            raise ValueError(
+                f"Coverage batch group {sample_id!r} must be a JSON object."
+            )
+        root_text = raw_group.get("configs_root")
+        if not isinstance(root_text, str) or not root_text.strip():
+            raise ValueError(
+                f"Coverage batch group {sample_id!r} requires a non-empty configs_root."
+            )
+        root_value = expand_user_path(root_text)
+        configs_root = (
+            root_value if root_value.is_absolute() else path.parent / root_value
+        ).resolve()
+        if not configs_root.exists() or not configs_root.is_dir():
+            raise FileNotFoundError(
+                f"configs_root for coverage batch group {sample_id!r} does not exist or is not a directory: '{configs_root}'."
+            )
+        config_names = raw_group.get("config_names")
+        if not isinstance(config_names, list) or not config_names:
+            raise ValueError(
+                f"Coverage batch group {sample_id!r} requires a non-empty config_names list."
+            )
+
+        assignments: list[CoverageBatchAssignment] = []
+        assigned_tiffs: dict[Path, Path] = {}
+        for raw_config_name in config_names:
+            if not isinstance(raw_config_name, str):
+                raise ValueError(
+                    f"Coverage batch group {sample_id!r} config_names entries must be strings."
+                )
+            config_path = _resolve_manifest_config_path(configs_root, raw_config_name)
+            if not config_path.is_file():
+                raise FileNotFoundError(
+                    f"Coverage config for scientific sample {sample_id!r} does not exist: '{config_path}'."
+                )
+            try:
+                app_config = load_coverage_app_config(config_path)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+                raise ValueError(
+                    f"Invalid coverage config '{config_path}' assigned to scientific sample {sample_id!r}: {exc}"
+                ) from exc
+            try:
+                source = resolve_coverage_source(
+                    cli_root=None,
+                    app_config=app_config,
+                    config_path=config_path,
+                )
+                if source is None:
+                    raise ValueError("the config does not define a folder source")
+                image_paths = _coverage_source_image_paths(source, sort_by=sort_by)
+            except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+                raise ValueError(
+                    f"Unusable coverage source in config '{config_path}' assigned to scientific sample {sample_id!r}: {exc}"
+                ) from exc
+            if not image_paths:
+                raise ValueError(
+                    f"Coverage config '{config_path}' assigned to scientific sample {sample_id!r} identifies no analyzable TIFF data."
+                )
+            for image_path in image_paths:
+                canonical = image_path.resolve()
+                prior_config = assigned_tiffs.get(canonical)
+                if prior_config is not None:
+                    raise ValueError(
+                        f"Duplicate TIFF assignment for scientific sample {sample_id!r}: "
+                        f"'{canonical}' is assigned by both '{prior_config}' and '{config_path}'."
+                    )
+                assigned_tiffs[canonical] = config_path
+            assignments.append(
+                CoverageBatchAssignment(
+                    config_name=config_path.stem,
+                    config_path=config_path,
+                    app_config=app_config,
+                    source=source,
+                    image_paths=image_paths,
+                )
+            )
+        groups.append(CoverageBatchGroup(sample_id, tuple(assignments)))
+    return CoverageBatchManifest(path, tuple(groups))
 
 
 def _count_images(sample_dirs: Iterable[Path]) -> int:
@@ -332,8 +566,16 @@ def _run_bead_batch(
 def _coverage_branch_configs(config, selection: str) -> list[tuple[str, str, object]]:
     """Return immutable branch viewer configs without changing the loaded config."""
     configured = bool(config.ag_enable_secondary_coverage)
+    configured_label = (
+        "configured secondary coverage branch enabled"
+        if configured
+        else "configured primary-only coverage branch"
+    )
+    if selection == "configured":
+        # Preserve the loaded object exactly: this mode delegates the branch
+        # choice to each individual tuned config, including grouped manifests.
+        return [("configured", configured_label, config)]
     choices = {
-        "configured": [("two_layers" if configured else "one_layer", configured)],
         "one-layer": [("one_layer", False)],
         "two-layers": [("two_layers", True)],
         "both": [("one_layer", False), ("two_layers", True)],
@@ -346,6 +588,12 @@ def _coverage_branch_configs(config, selection: str) -> list[tuple[str, str, obj
         )
         for branch_id, enabled in choices
     ]
+
+
+def _coverage_branch_output_dir(outputs_dir: Path, branch_id: str) -> Path:
+    """Keep configured output flat; explicit comparison branches stay isolated."""
+
+    return outputs_dir if branch_id == "configured" else outputs_dir / f"coverage_{branch_id}"
 
 
 @dataclass
@@ -460,7 +708,7 @@ def _run_coverage_batch(
     outputs_dir: Path,
     *,
     sort_by: str = "name",
-    branches: str = "both",
+    branches: str = "configured",
     debug_performance: bool = False,
 ) -> list[Path]:
     root = source.root
@@ -477,7 +725,7 @@ def _run_coverage_batch(
             tracing_started_here = True
     try:
         for branch_id, branch_label, viewer_config in branch_configs:
-            branch_dir = outputs_dir / f"coverage_{branch_id}"
+            branch_dir = _coverage_branch_output_dir(outputs_dir, branch_id)
             png_dir = branch_dir / "coverage_png"
             for sample_dir in sample_dirs:
                 image_paths = tuple(
@@ -625,6 +873,354 @@ def _run_coverage_batch(
     return written
 
 
+def _group_branch_plans(
+    group: CoverageBatchGroup,
+    selection: str,
+) -> list[tuple[str, str, list[tuple[CoverageBatchAssignment, Any]]]]:
+    """Arrange per-config immutable branch configs into scientific branches."""
+
+    by_branch: dict[
+        str, tuple[str, list[tuple[CoverageBatchAssignment, Any]]]
+    ] = {}
+    for assignment in group.assignments:
+        for branch_id, branch_label, viewer_config in _coverage_branch_configs(
+            assignment.app_config.viewer, selection
+        ):
+            if branch_id not in by_branch:
+                by_branch[branch_id] = (branch_label, [])
+            by_branch[branch_id][1].append((assignment, viewer_config))
+    plans = [
+        (branch_id, label, assignments)
+        for branch_id, (label, assignments) in by_branch.items()
+    ]
+    if selection == "configured" and plans:
+        return [
+            (
+                "configured",
+                "coverage branch selected by each analysis config",
+                plans[0][2],
+            )
+        ]
+    return plans
+
+
+def _meaningful_assignment_source(assignment: CoverageBatchAssignment) -> Path:
+    """Return the sample-level source path used by existing global summaries.
+
+    Even when a config selects one file, the established global ``source_path``
+    is its containing source folder.  Exact selected-file provenance remains in
+    ``coverage_source_file`` and each image's ``source_path``.
+    """
+
+    return assignment.source.root.resolve()
+
+
+def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in paths:
+        canonical = path.resolve()
+        if canonical not in seen:
+            seen.add(canonical)
+            unique.append(canonical)
+    return unique
+
+
+def _group_png_names(group: CoverageBatchGroup) -> dict[Path, str]:
+    """Choose deterministic TIFF-derived PNG names without silent collisions."""
+
+    items = [
+        (assignment, image_path.resolve())
+        for assignment in group.assignments
+        for image_path in assignment.image_paths
+    ]
+    bases = [_safe_name(path.stem) or "image" for _assignment, path in items]
+    counts: dict[str, int] = {}
+    for base in bases:
+        counts[base.casefold()] = counts.get(base.casefold(), 0) + 1
+
+    used: set[str] = set()
+    names: dict[Path, str] = {}
+    for (assignment, image_path), base in zip(items, bases):
+        if counts[base.casefold()] == 1:
+            candidate = base
+        else:
+            config_part = _safe_name(assignment.config_name) or "config"
+            candidate = f"{base}__{config_part}"
+            if candidate.casefold() in used:
+                parent_part = _safe_name(image_path.parent.name) or "source"
+                candidate = f"{base}__{config_part}__{parent_part}"
+            sequence = 2
+            unsuffixed = candidate
+            while candidate.casefold() in used:
+                candidate = f"{unsuffixed}__{sequence}"
+                sequence += 1
+        used.add(candidate.casefold())
+        names[image_path] = f"{candidate}.png"
+    return names
+
+
+def _assignment_provenance(
+    assignment: CoverageBatchAssignment,
+) -> dict[str, object]:
+    return {
+        "analysis_config_name": assignment.config_name,
+        "analysis_config_path": str(assignment.config_path.resolve()),
+        "coverage_source_origin": "batch_manifest",
+        "coverage_source_root": str(assignment.source.root.resolve()),
+        "coverage_source_file": (
+            None
+            if assignment.source.selected_file is None
+            else str(assignment.source.selected_file.resolve())
+        ),
+    }
+
+
+def _common_value(items: list[Any]) -> Any:
+    """Return one truthful shared scalar, or None when values differ."""
+
+    if not items:
+        return None
+    first = items[0]
+    return first if all(item == first for item in items[1:]) else None
+
+
+def _run_grouped_coverage_batch(
+    manifest: CoverageBatchManifest,
+    outputs_dir: Path,
+    *,
+    branches: str = "configured",
+    debug_performance: bool = False,
+) -> list[Path]:
+    """Stream preflighted tuned-config assignments into pooled sample summaries."""
+
+    written: list[Path] = []
+    total = sum(
+        len(assignment.image_paths)
+        for group in manifest.groups
+        for _branch_id, _label, branch_assignments in _group_branch_plans(
+            group, branches
+        )
+        for assignment, _viewer_config in branch_assignments
+    )
+    progress = _progress(desc="Grouped coverage branch images", total=total)
+    tracing_started_here = False
+    if debug_performance:
+        _enable_performance_logger()
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+            tracing_started_here = True
+    try:
+        for group in manifest.groups:
+            png_names = _group_png_names(group)
+            source_paths = _unique_paths(
+                _meaningful_assignment_source(assignment)
+                for assignment in group.assignments
+            )
+            source_path = str(source_paths[0]) if len(source_paths) == 1 else None
+            source_roots = _unique_paths(
+                assignment.source.root for assignment in group.assignments
+            )
+            source_root = str(source_roots[0]) if len(source_roots) == 1 else None
+            for branch_id, branch_label, branch_assignments in _group_branch_plans(
+                group, branches
+            ):
+                branch_dir = _coverage_branch_output_dir(outputs_dir, branch_id)
+                png_dir = branch_dir / "coverage_png" / _safe_name(group.sample_id)
+                image_paths = tuple(
+                    path
+                    for assignment, _viewer_config in branch_assignments
+                    for path in assignment.image_paths
+                )
+                branch_viewers = [
+                    viewer_config
+                    for _assignment, viewer_config in branch_assignments
+                ]
+                builder = CoverageSampleSummaryBuilder(
+                    sample_dir=Path(source_path or ""),
+                    config=branch_viewers[0],
+                    image_paths=image_paths,
+                )
+                image_number = 0
+                for assignment, viewer_config in branch_assignments:
+                    provenance = _assignment_provenance(assignment)
+                    image_branch_label = (
+                        (
+                            "configured secondary coverage branch enabled"
+                            if viewer_config.ag_enable_secondary_coverage
+                            else "configured primary-only coverage branch"
+                        )
+                        if branch_id == "configured"
+                        else branch_label
+                    )
+                    for image_path in assignment.image_paths:
+                        image_number += 1
+                        total_start = perf_counter()
+                        analysis_seconds = serialization_seconds = png_seconds = 0.0
+                        result = None
+                        stored_record = None
+                        image_record = None
+                        try:
+                            phase_start = perf_counter()
+                            result = analyze_coverage_image(image_path, viewer_config)
+                            analysis_seconds = perf_counter() - phase_start
+
+                            phase_start = perf_counter()
+                            image_record = dict(
+                                build_coverage_image_record(
+                                    image_path, viewer_config, result
+                                )
+                            )
+                            record_metadata = {
+                                "sample": group.sample_id,
+                                "source_path": str(image_path.resolve()),
+                                "coverage_branch_id": branch_id,
+                                "coverage_branch_label": image_branch_label,
+                                "ag_enable_secondary_coverage": bool(
+                                    viewer_config.ag_enable_secondary_coverage
+                                ),
+                                **provenance,
+                            }
+                            image_record.update(record_metadata)
+                            for roi in image_record.get("rois", []):
+                                if isinstance(roi, dict):
+                                    roi.update(record_metadata)
+                            stored_record = builder.add_success(
+                                image_path, image_record
+                            )
+                            serialization_seconds = perf_counter() - phase_start
+
+                            phase_start = perf_counter()
+                            try:
+                                png_path = _export_coverage_png(
+                                    image_path,
+                                    viewer_config,
+                                    png_dir / png_names[image_path.resolve()],
+                                    result=result,
+                                    branch_label=image_branch_label,
+                                )
+                            finally:
+                                png_seconds = perf_counter() - phase_start
+                            written.append(png_path)
+                        except Exception as exc:
+                            if stored_record is not None:
+                                builder.discard_success(stored_record)
+                            builder.add_failure(
+                                image_path,
+                                exc,
+                                branch_id=branch_id,
+                                branch_label=image_branch_label,
+                            )
+                            builder.failures[-1].update(
+                                {
+                                    "sample": group.sample_id,
+                                    "source_path": str(image_path.resolve()),
+                                    "ag_enable_secondary_coverage": bool(
+                                        viewer_config.ag_enable_secondary_coverage
+                                    ),
+                                    **provenance,
+                                }
+                            )
+                        finally:
+                            result = None
+                            stored_record = None
+                            image_record = None
+                            if progress is not None:
+                                progress.update(1)
+                            if debug_performance:
+                                _report_image_performance(
+                                    branch_id=branch_id,
+                                    sample=group.sample_id,
+                                    image_index=image_number,
+                                    image_count=len(image_paths),
+                                    analysis_seconds=analysis_seconds,
+                                    serialization_seconds=serialization_seconds,
+                                    png_seconds=png_seconds,
+                                    total_seconds=perf_counter() - total_start,
+                                )
+
+                summary = builder.finalize()
+                config_dicts = [asdict(viewer) for viewer in branch_viewers]
+                summary["viewer_config"] = _common_value(config_dicts)
+                summary["folder"] = source_path or ""
+                summary["file"] = None
+                summary["sample"] = group.sample_id
+                summary["source_path"] = source_path
+                summary["source_paths"] = [str(path) for path in source_paths]
+                summary["coverage_branch_id"] = branch_id
+                summary["coverage_branch_label"] = branch_label
+                configured_secondary = _common_value(
+                    [
+                        bool(viewer.ag_enable_secondary_coverage)
+                        for viewer in branch_viewers
+                    ]
+                )
+                summary["ag_enable_secondary_coverage"] = configured_secondary
+                summary["coverage_source_origin"] = "batch_manifest"
+                summary["coverage_source_root"] = source_root
+                summary["coverage_source_file"] = None
+                summary["batch_manifest_path"] = str(manifest.path)
+                summary["analysis_configs"] = [
+                    {
+                        **_assignment_provenance(assignment),
+                        "source_path": str(_meaningful_assignment_source(assignment)),
+                    }
+                    for assignment, _viewer_config in branch_assignments
+                ]
+                global_summary = summary.setdefault("global_summary", {})
+                global_summary.update(
+                    {
+                        "coverage_branch_id": branch_id,
+                        "coverage_branch_label": branch_label,
+                        "ag_enable_secondary_coverage": configured_secondary,
+                        "coverage_source_origin": "batch_manifest",
+                        "coverage_source_root": source_root,
+                        "coverage_source_file": None,
+                        "source_path": source_path,
+                        "source_paths": [str(path) for path in source_paths],
+                    }
+                )
+                for field_name in (
+                    "sphere_anisotropy_check",
+                    "max_global_sphere_anisotropy_ratio",
+                    "sphere_solidity_check",
+                    "min_global_sphere_solidity",
+                    "selected_cap_coverage_metric",
+                    "coverage_cap_radius_fraction",
+                ):
+                    global_summary[field_name] = _common_value(
+                        [getattr(viewer, field_name) for viewer in branch_viewers]
+                    )
+                out_path = branch_dir / f"{_safe_name(group.sample_id)}__coverage.json"
+                _write_json(summary, out_path)
+                written.append(out_path)
+
+                builder.image_records.clear()
+                builder.failures.clear()
+                del summary
+                del builder
+                if debug_performance:
+                    collected = gc.collect()
+                    current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+                    LOGGER.debug(
+                        "coverage-sample-release branch=%s sample=%s "
+                        "collected=%d figures=%d traced_current_mib=%.3f "
+                        "traced_peak_mib=%.3f",
+                        branch_id,
+                        group.sample_id,
+                        collected,
+                        len(plt.get_fignums()),
+                        current_bytes / 2**20,
+                        peak_bytes / 2**20,
+                    )
+    finally:
+        if progress is not None:
+            progress.close()
+        if tracing_started_here:
+            tracemalloc.stop()
+    return written
+
+
 def _remove_outputs(outputs_dir: Path) -> None:
     if not outputs_dir.exists():
         return
@@ -643,7 +1239,7 @@ def _remove_outputs(outputs_dir: Path) -> None:
     for png_dir_name in ("size_png", "coverage_png"):
         png_dir = outputs_dir / png_dir_name
         if png_dir.exists():
-            for path in png_dir.glob("*.png"):
+            for path in png_dir.rglob("*.png"):
                 path.unlink()
     for branch_name in ("coverage_one_layer", "coverage_two_layers"):
         branch = outputs_dir / branch_name
@@ -668,25 +1264,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Batch-run SEM bead and coverage summaries for all TIFF-containing subfolders, then export CSV summaries."
     )
-    parser.add_argument("--bead-root", type=Path, help="Root folder for bead protocol samples.")
+    parser.add_argument("--bead-root", type=Path, help="Optional bead root override. Without it, an explicitly selected --bead-config may supply its folder.")
     parser.add_argument(
         "--bead-config",
         type=Path,
         default=Path("sem_bead_viewer_config.json"),
-        help="Config file used as a parameter template for bead analysis.",
+        help="Config file used for bead parameters and, when --bead-root is omitted, its top-level folder source.",
     )
-    parser.add_argument("--coverage-root", type=Path, help="Optional recursive coverage root. Overrides the folder/file source stored in --coverage-config.")
-    parser.add_argument(
+    parser.add_argument("--coverage-root", type=Path, help="Optional recursive coverage root. Overrides the folder/file source stored in --coverage-config; incompatible with --batch-config.")
+    coverage_source_group = parser.add_mutually_exclusive_group()
+    coverage_source_group.add_argument(
         "--coverage-config",
         type=Path,
         default=Path("sem_coverage_viewer_config.json"),
         help="Coverage parameter template; its top-level folder/file fields may also supply the input source.",
     )
+    coverage_source_group.add_argument(
+        "--batch-config",
+        type=Path,
+        help=(
+            "Grouped coverage manifest. Top-level keys are scientific sample IDs; "
+            "each entry supplies configs_root and a non-empty config_names list."
+        ),
+    )
     parser.add_argument(
         "--coverage-branches",
         choices=("both", "configured", "one-layer", "two-layers"),
-        default="both",
-        help="Coverage-mask branches to process. Default: %(default)s",
+        default="configured",
+        help=(
+            "Coverage-mask mode. 'configured' (default) uses each coverage "
+            "config's ag_enable_secondary_coverage value and writes directly "
+            "to outputs-dir; explicit comparison branches use separate directories."
+        ),
     )
     parser.add_argument(
         "--outputs-dir",
@@ -724,24 +1333,57 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     command_args = list(sys.argv[1:] if argv is None else argv)
+    if args.batch_config is not None and args.coverage_root is not None:
+        parser.error("--coverage-root cannot be combined with --batch-config; each manifest subconfig supplies its own source.")
+    bead_config_requested = any(
+        item == "--bead-config" or item.startswith("--bead-config=")
+        for item in command_args
+    )
     coverage_config_requested = any(
         item == "--coverage-config" or item.startswith("--coverage-config=")
         for item in command_args
     )
+
+    bead_source = None
+    bead_config_path = expand_user_path(args.bead_config)
+    if args.bead_root is not None or bead_config_requested:
+        bead_app_config = load_bead_app_config(bead_config_path)
+        bead_source = resolve_bead_source(
+            cli_root=args.bead_root,
+            app_config=bead_app_config,
+            config_path=bead_config_path,
+        )
+        if bead_source is None:
+            raise SystemExit(
+                "No bead input source was provided. Supply --bead-root or a bead config containing a valid top-level folder source."
+            )
+        # Validate the selected bead population before cleaning or creating outputs.
+        _find_sample_dirs(bead_source.root)
+
     coverage_config_path = expand_user_path(args.coverage_config)
     coverage_app_config = None
     coverage_source = None
-    if args.coverage_root is not None or coverage_config_requested:
+    coverage_manifest = None
+    if args.batch_config is not None:
+        coverage_manifest = load_coverage_batch_manifest(
+            args.batch_config,
+            sort_by=args.sort_by,
+        )
+    elif args.coverage_root is not None or coverage_config_requested:
         coverage_app_config = load_coverage_app_config(coverage_config_path)
         coverage_source = resolve_coverage_source(
             cli_root=args.coverage_root,
             app_config=coverage_app_config,
             config_path=coverage_config_path,
         )
-    if not args.bead_root and coverage_source is None:
-        raise SystemExit("No input source was provided. Supply --bead-root, --coverage-root, or a coverage config containing a valid top-level folder/file source.")
+    if bead_source is None and coverage_source is None and coverage_manifest is None:
+        raise SystemExit(
+            "No input source was provided. Supply --bead-root/--bead-config, "
+            "--coverage-root/--coverage-config, or --batch-config."
+        )
 
     outputs_dir = expand_user_path(args.outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -749,11 +1391,15 @@ def main(argv: list[str] | None = None) -> None:
         _remove_outputs(outputs_dir)
 
     written: list[Path] = []
-    if args.bead_root:
+    if bead_source is not None:
+        if bead_source.source_origin == "config":
+            print(f"Bead source from config: recursive folder ({bead_source.root})")
+        else:
+            print(f"Bead source from CLI: recursive folder ({bead_source.root})")
         written.extend(
             _run_bead_batch(
-                expand_user_path(args.bead_root),
-                expand_user_path(args.bead_config),
+                bead_source.root,
+                bead_config_path,
                 outputs_dir,
                 sort_by=args.sort_by,
             )
@@ -773,8 +1419,20 @@ def main(argv: list[str] | None = None) -> None:
                 debug_performance=args.debug_performance,
             )
         )
+    if coverage_manifest is not None:
+        print(
+            f"Coverage source from grouped manifest: {len(coverage_manifest.groups)} scientific sample group(s)"
+        )
+        written.extend(
+            _run_grouped_coverage_batch(
+                coverage_manifest,
+                outputs_dir,
+                branches=args.coverage_branches,
+                debug_performance=args.debug_performance,
+            )
+        )
     if not args.no_export:
-        if args.bead_root:
+        if bead_source is not None:
             written.extend(
                 export_outputs(
                     outputs_dir,
@@ -788,14 +1446,16 @@ def main(argv: list[str] | None = None) -> None:
                     sort_by=args.sort_by,
                 )
             )
-        if coverage_source is not None:
-            branch_names = (
-                ("coverage_one_layer", "coverage_two_layers")
-                if args.coverage_branches == "both"
-                else (("coverage_one_layer",) if args.coverage_branches == "one-layer" else ("coverage_two_layers",) if args.coverage_branches == "two-layers" else ("coverage_two_layers", "coverage_one_layer"))
+        if coverage_source is not None or coverage_manifest is not None:
+            coverage_export_dirs = (
+                (outputs_dir,)
+                if args.coverage_branches == "configured"
+                else tuple(
+                    outputs_dir / name
+                    for name in ("coverage_one_layer", "coverage_two_layers")
+                )
             )
-            for name in branch_names:
-                branch_dir = outputs_dir / name
+            for branch_dir in coverage_export_dirs:
                 if branch_dir.exists() and any(branch_dir.glob("*.json")):
                     written.extend(export_outputs(branch_dir, csv=not args.no_csv, bead=False, coverage=True, bead_csv=False, coverage_csv=not args.no_coverage_csv, histograms=False, table_format=args.table_format, sort_by=args.sort_by))
 
