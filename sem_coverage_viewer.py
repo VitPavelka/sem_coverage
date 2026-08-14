@@ -25,6 +25,7 @@ from tifffile import imread
 from path_utils import (
     expand_user_path,
     path_to_config_text,
+    resolve_configured_image_source,
     resolve_existing_input_path,
     resolve_optional_file_in_folder,
 )
@@ -2423,24 +2424,20 @@ def run_from_config(
     if not config_path.exists():
         save_default_config(
             config_path,
-            r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\PVP 10 kDa, 10x AgNPs",
+            Path(__file__).resolve().parent
+            / "testData"
+            / "100226"
+            / "PVP 10 kDa, 10x AgNPs",
         )
     app_cfg = load_app_config(config_path)
-    effective_folder = (
-        expand_user_path(folder_override)
-        if folder_override is not None
-        else resolve_existing_input_path(
-            app_cfg.folder, config_path=config_path, description="image folder"
-        )
-    )
-    effective_file = (
-        resolve_optional_file_in_folder(effective_folder, file_override)
-        if file_override is not None
-        else (
-            resolve_optional_file_in_folder(effective_folder, app_cfg.file)
-            if app_cfg.file
-            else None
-        )
+    source_folder = folder_override if folder_override is not None else app_cfg.folder
+    source_file = file_override if file_override is not None else app_cfg.file
+    effective_folder, effective_file = resolve_configured_image_source(
+        source_folder,
+        source_file,
+        config_path=config_path,
+        description="coverage image source",
+        allowed_suffixes=(".tif",),
     )
     if app_cfg.summary_json_path:
         write_coverage_summary_json(

@@ -6,6 +6,25 @@ from pathlib import Path
 from tabular_export import sort_paths
 
 
+class ConfiguredSourceError(FileNotFoundError):
+    """A configured folder/file source could not be resolved during preflight."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        config_path: Path,
+        configured_folder: str,
+        configured_file: str | None,
+        resolved_path: Path,
+    ) -> None:
+        super().__init__(message)
+        self.config_path = config_path
+        self.configured_folder = configured_folder
+        self.configured_file = configured_file
+        self.resolved_path = resolved_path
+
+
 def expand_user_path(value: str | Path) -> Path:
     """Expand environment variables, whitespace, and ``~`` in one path value."""
 
@@ -93,6 +112,84 @@ def resolve_optional_file_in_folder(
     raise FileNotFoundError(
         f"{description.capitalize()} does not exist: '{resolved}'."
     )
+
+
+def resolve_configured_image_source(
+    folder_value: str | Path,
+    file_value: str | Path | None,
+    *,
+    config_path: str | Path,
+    description: str = "image source",
+    allowed_suffixes: tuple[str, ...] | None = None,
+) -> tuple[Path, Path | None]:
+    """Resolve and preflight one config-owned folder and optional file.
+
+    Folder resolution deliberately retains :func:`resolve_existing_input_path`
+    semantics. A relative file is always interpreted inside the resolved
+    folder. Failures include all source fields needed to repair a stale config.
+    """
+
+    config = expand_user_path(config_path).resolve()
+    configured_folder = str(folder_value).strip()
+    configured_file = None if file_value in (None, "") else str(file_value).strip()
+
+    folder_candidate = expand_user_path(configured_folder)
+    if folder_candidate.is_absolute():
+        attempted_folder = folder_candidate
+    else:
+        cwd_candidate = folder_candidate.resolve()
+        config_candidate = (config.parent / folder_candidate).resolve()
+        attempted_folder = cwd_candidate if folder_candidate.exists() else config_candidate
+
+    def fail(reason: str, resolved_path: Path) -> ConfiguredSourceError:
+        file_text = (
+            ""
+            if configured_file is None
+            else f", configured file={configured_file!r}"
+        )
+        return ConfiguredSourceError(
+            f"Invalid {description} in config '{config}': configured folder="
+            f"{configured_folder!r}{file_text}; resolved path='{resolved_path}'. "
+            f"{reason}",
+            config_path=config,
+            configured_folder=configured_folder,
+            configured_file=configured_file,
+            resolved_path=resolved_path,
+        )
+
+    try:
+        folder = resolve_existing_input_path(
+            configured_folder,
+            config_path=config,
+            description=f"{description} folder",
+        ).resolve()
+    except FileNotFoundError as exc:
+        raise fail("The configured folder does not exist.", attempted_folder) from exc
+    if not folder.is_dir():
+        raise fail("The configured folder is not a directory.", folder)
+
+    if configured_file is None:
+        return folder, None
+
+    file_candidate = expand_user_path(configured_file)
+    resolved_file = (
+        file_candidate.resolve()
+        if file_candidate.is_absolute()
+        else (folder / file_candidate).resolve()
+    )
+    if not resolved_file.exists():
+        raise fail("The configured file does not exist.", resolved_file)
+    if not resolved_file.is_file():
+        raise fail("The configured file is not a regular file.", resolved_file)
+    if allowed_suffixes is not None:
+        normalized_suffixes = {suffix.lower() for suffix in allowed_suffixes}
+        if resolved_file.suffix.lower() not in normalized_suffixes:
+            expected = ", ".join(sorted(normalized_suffixes))
+            raise fail(
+                f"The configured file type is unsupported; expected one of: {expected}.",
+                resolved_file,
+            )
+    return folder, resolved_file
 
 
 def discover_images_recursive(

@@ -71,6 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    viewer: DiagnosticViewer | None = None
     try:
         adapter_class = resolve_adapter(args.mode)
         viewer = DiagnosticViewer(
@@ -82,12 +83,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             asynchronous=not args.no_async,
         )
         viewer.show()
-        viewer.close()
     except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as exc:
         logging.getLogger(__name__).error("%s", exc)
         parser.exit(2, f"error: {exc}\n")
     except KeyboardInterrupt:
         return 130
+    finally:
+        if viewer is not None:
+            viewer.close()
     return 0
 
 

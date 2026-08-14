@@ -91,7 +91,13 @@ from coverage_local_heterogeneity import (
     local_grid_indices,
 )
 from sem_coverage import AnalyzerConfig, SEMCoverageAnalyzer
-from path_utils import discover_images_recursive, path_to_config_text, resolve_optional_file_in_folder
+from path_utils import (
+    ConfiguredSourceError,
+    discover_images_recursive,
+    path_to_config_text,
+    resolve_configured_image_source,
+    resolve_optional_file_in_folder,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -2934,25 +2940,97 @@ def save_tuned_config(
     return output_path
 
 
-def choose_json_save_path(initial_path: Path, figure: Figure) -> Path | None:
-    """Choose a JSON destination with the standard-library native Tk dialog."""
-    root: Any | None = None
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root=tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
-        selected=filedialog.asksaveasfilename(parent=root, initialdir=str(initial_path.parent), initialfile=initial_path.name, defaultextension=".json", filetypes=(("JSON files","*.json"),("All files","*.*")))
-    except Exception:
-        LOGGER.debug("Native save dialog unavailable", exc_info=True)
-        return None
-    finally:
+class _NativeDialogResource:
+    """Own a native dialog parent without creating a competing GUI loop."""
+
+    def __init__(self, figure: Figure, tk_module: Any) -> None:
+        manager = getattr(getattr(figure, "canvas", None), "manager", None)
+        window = getattr(manager, "window", None)
+        if window is not None and hasattr(window, "wait_window") and hasattr(window, "tk"):
+            self.parent = window
+            self._owned_root = None
+        else:
+            self._owned_root = tk_module.Tk()
+            self._owned_root.withdraw()
+            self.parent = self._owned_root
+        self.dialog: Any | None = None
+        self._closed = False
+
+    def close_dialog(self) -> None:
+        dialog, self.dialog = self.dialog, None
+        if dialog is None:
+            return
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.close_dialog()
+        root, self._owned_root = self._owned_root, None
         if root is not None:
             try:
                 root.destroy()
             except Exception:
                 pass
-    if not selected: return None
-    path=Path(selected)
+
+
+DialogResourceCallback = Callable[[_NativeDialogResource | None], None]
+
+
+def _dialog_initial_directory(path: Path | None) -> Path:
+    """Return an existing directory acceptable to native chooser APIs."""
+
+    candidate = Path.cwd() if path is None else path.expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    if candidate.parent.is_dir():
+        return candidate.parent.resolve()
+    return Path.cwd().resolve()
+
+
+def choose_json_save_path(
+    initial_path: Path,
+    figure: Figure,
+    *,
+    resource_callback: DialogResourceCallback | None = None,
+) -> Path | None:
+    """Choose a JSON destination using the active GUI application's parent."""
+
+    resource: _NativeDialogResource | None = None
+    selected = ""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        resource = _NativeDialogResource(figure, tk)
+        if resource_callback is not None:
+            resource_callback(resource)
+        selected = filedialog.asksaveasfilename(
+            parent=resource.parent,
+            initialdir=str(_dialog_initial_directory(initial_path.parent)),
+            initialfile=initial_path.name,
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+    except Exception:
+        LOGGER.debug("Native save dialog unavailable", exc_info=True)
+        return None
+    finally:
+        if resource_callback is not None:
+            resource_callback(None)
+        if resource is not None:
+            resource.close()
+    if not selected:
+        return None
+    path = Path(selected)
     return path if path.suffix else path.with_suffix(".json")
 
 
@@ -2974,35 +3052,46 @@ class DataSourceDialogResult:
     error_message: str | None = None
 
 
-def choose_data_source(initial_directory: Path | None, figure: Figure) -> DataSourceDialogResult:
-    """Use a viewable, short-lived Tk modal to choose one image or a folder."""
-    root: Any | None = None
-    dialog: Any | None = None
+def choose_data_source(
+    initial_directory: Path | None,
+    figure: Figure,
+    *,
+    resource_callback: DialogResourceCallback | None = None,
+) -> DataSourceDialogResult:
+    """Choose an image or folder in a modal owned by the active GUI."""
+
+    resource: _NativeDialogResource | None = None
     choice: dict[str, SelectedDataSource | None] = {"value": None}
     try:
         import tkinter as tk
         from tkinter import filedialog
 
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        dialog = tk.Toplevel(root)
+        resource = _NativeDialogResource(figure, tk)
+        if resource_callback is not None:
+            resource_callback(resource)
+        dialog = tk.Toplevel(resource.parent)
+        resource.dialog = dialog
         dialog.title("Load diagnostic data")
-        dialog.transient(root)
+        dialog.transient(resource.parent)
 
         def finish() -> None:
-            # The outer finally block owns destruction, avoiding double-destroy
-            # races from Tk button callbacks.
-            dialog.quit()
+            resource.close_dialog()
 
         def select_file() -> None:
-            path = filedialog.askopenfilename(parent=dialog, initialdir=str(initial_directory or Path.cwd()), filetypes=(("Supported images", "*.tif *.tiff *.png *.jpg *.jpeg"), ("All files", "*.*")))
+            path = filedialog.askopenfilename(
+                parent=dialog,
+                initialdir=str(_dialog_initial_directory(initial_directory)),
+                filetypes=(("TIFF images", "*.tif *.tiff"), ("All files", "*.*")),
+            )
             if path:
                 choice["value"] = SelectedDataSource(Path(path).parent, Path(path).name)
             finish()
 
         def select_folder() -> None:
-            path = filedialog.askdirectory(parent=dialog, initialdir=str(initial_directory or Path.cwd()))
+            path = filedialog.askdirectory(
+                parent=dialog,
+                initialdir=str(_dialog_initial_directory(initial_directory)),
+            )
             if path:
                 choice["value"] = SelectedDataSource(Path(path), None)
             finish()
@@ -3014,28 +3103,18 @@ def choose_data_source(initial_directory: Path | None, figure: Figure) -> DataSo
         dialog.update_idletasks()
         dialog.deiconify()
         dialog.lift()
-        dialog.wait_visibility()
+        dialog.focus_set()
         dialog.grab_set()
-        root.mainloop()
+        resource.parent.wait_window(dialog)
         return DataSourceDialogResult(choice["value"], choice["value"] is None)
     except Exception as exc:
         LOGGER.exception("Could not open native data-source dialog")
         return DataSourceDialogResult(None, False, str(exc))
     finally:
-        if dialog is not None:
-            try:
-                dialog.grab_release()
-            except Exception:
-                pass
-            try:
-                dialog.destroy()
-            except Exception:
-                pass
-        if root is not None:
-            try:
-                root.destroy()
-            except Exception:
-                pass
+        if resource_callback is not None:
+            resource_callback(None)
+        if resource is not None:
+            resource.close()
 
 
 class _DaemonTaskRunner:
@@ -3043,12 +3122,14 @@ class _DaemonTaskRunner:
 
     def __init__(self) -> None:
         self._shutdown = False
+        self._lock = RLock()
 
     def submit(self, function: Callable[..., Any], *args: Any) -> Future[Any]:
         future: Future[Any] = Future()
-        if self._shutdown:
-            future.cancel()
-            return future
+        with self._lock:
+            if self._shutdown:
+                future.cancel()
+                return future
 
         def run() -> None:
             if not future.set_running_or_notify_cancel():
@@ -3058,13 +3139,19 @@ class _DaemonTaskRunner:
             except BaseException as exc:
                 future.set_exception(exc)
 
-        Thread(target=run, name="sem-coverage-diagnostic", daemon=True).start()
+        worker = Thread(target=run, name="sem-coverage-diagnostic", daemon=True)
+        with self._lock:
+            if self._shutdown:
+                future.cancel()
+                return future
+            worker.start()
         return future
 
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
         """A daemon task is abandoned after the controller has been closed."""
 
-        self._shutdown = True
+        with self._lock:
+            self._shutdown = True
 
 
 class AnalysisController:
@@ -3352,7 +3439,7 @@ class DiagnosticViewer:
         self.adapter = adapter
         self.config_path = Path(config_path).expanduser().resolve()
         self._cli_selected_file = Path(selected_file).expanduser() if selected_file else None
-        self.selected_file = self._cli_selected_file
+        self.selected_file: Path | None = None
         self.folder_override = (
             Path(folder_override).expanduser().resolve() if folder_override else None
         )
@@ -3367,18 +3454,18 @@ class DiagnosticViewer:
             self.adapter.load_config(self.config_path)
         )
         self.current_viewer_config = self.original_viewer_config
-        self.folder = self.folder_override or (Path(self.app_config.folder).expanduser() if self.app_config.folder else None)
+        self.folder: Path | None = None
         self.image_paths: list[Path] = []
         self._data_message = ""
-        if self.folder is not None:
-            try:
-                self.image_paths = self.adapter.resolve_images(self.folder, self.app_config, self.selected_file)
-            except (OSError, ValueError, FileNotFoundError) as exc:
-                self._data_message = f"No data loaded: {exc}"
-        if self.selected_file is None and self.app_config.file and self.image_paths:
-            # A config-level file selection has the same effective source
-            # semantics as a file selected through the native dialog.
-            self.selected_file = Path(self.image_paths[0].name)
+        try:
+            self.folder, self.selected_file, self.image_paths = self._resolve_app_images(
+                self.app_config
+            )
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            if isinstance(exc, ConfiguredSourceError) and exc.configured_file:
+                if exc.resolved_path.parent.is_dir():
+                    self.folder = exc.resolved_path.parent
+            self._data_message = f"No data loaded: {exc}"
         if not self.image_paths and not self._data_message:
             self._data_message = "No data loaded. Use Load data to select an image or folder."
         self.index = self._resolve_start_index(self.selected_file) if self.image_paths else 0
@@ -3400,6 +3487,7 @@ class DiagnosticViewer:
         self._last_displayed_generation = 0
         self._updating = False
         self._closed = False
+        self._active_native_dialog: _NativeDialogResource | None = None
         self._ignore_control_events = False
         self._overwrite_confirmation_pending = False
         self._message = ""
@@ -3480,6 +3568,38 @@ class DiagnosticViewer:
             self._schedule_analysis(immediate=True)
         else:
             self._show_no_data_state()
+
+    def _resolve_app_images(self, app_config: Any) -> tuple[Path | None, Path | None, list[Path]]:
+        """Resolve diagnostic input with the same semantics as batch/viewer startup."""
+
+        folder_value: str | Path | None = self.folder_override
+        if folder_value is None:
+            folder_value = getattr(app_config, "folder", None)
+        if folder_value in (None, ""):
+            return None, None, []
+        file_value: str | Path | None = self._cli_selected_file
+        if file_value is None:
+            file_value = getattr(app_config, "file", None)
+        folder, resolved_file = resolve_configured_image_source(
+            folder_value,
+            file_value,
+            config_path=self.config_path,
+            description=f"{self.adapter.mode_name} diagnostic source",
+            allowed_suffixes=(".tif", ".tiff"),
+        )
+        images = self.adapter.resolve_images(folder, app_config, resolved_file)
+        selected_file: Path | None = None
+        if resolved_file is not None:
+            try:
+                selected_file = resolved_file.relative_to(folder)
+            except ValueError:
+                selected_file = resolved_file
+        return folder, selected_file, images
+
+    def _effective_file_text(self) -> str | None:
+        if self.selected_file is None:
+            return None
+        return path_to_config_text(self.selected_file)
 
     def _resolve_start_index(self, selected_file: str | Path | None) -> int:
         if selected_file is None:
@@ -3791,7 +3911,15 @@ class DiagnosticViewer:
 
     def load_data(self) -> None:
         """Replace only the effective image source, retaining tuned parameters."""
-        outcome = choose_data_source(self.folder, self.fig)
+        if self._closed:
+            return
+        outcome = choose_data_source(
+            self.folder,
+            self.fig,
+            resource_callback=self._set_active_native_dialog,
+        )
+        if self._closed:
+            return
         if outcome.error_message:
             self._message = f"Could not open the data-source dialog: {outcome.error_message}"
             self._update_status()
@@ -4323,6 +4451,8 @@ class DiagnosticViewer:
             self._debounce_timer.stop()
 
     def _schedule_analysis(self, *, immediate: bool = False) -> None:
+        if self._closed:
+            return
         if not self.image_paths:
             self._show_no_data_state()
             return
@@ -5214,7 +5344,15 @@ class DiagnosticViewer:
         self._commit_current_controls()
 
     def save(self) -> None:
-        selected = choose_json_save_path(self.output_config, self.fig)
+        if self._closed:
+            return
+        selected = choose_json_save_path(
+            self.output_config,
+            self.fig,
+            resource_callback=self._set_active_native_dialog,
+        )
+        if self._closed:
+            return
         if selected is None:
             self._message = "Save cancelled."
             self._update_status()
@@ -5233,14 +5371,14 @@ class DiagnosticViewer:
             saved_path = save_tuned_config(
                 self.raw_source_config, self.current_viewer_config, self.output_config,
                 effective_folder=self.folder,
-                effective_file=self.selected_file.name if self.selected_file is not None else None,
+                effective_file=self._effective_file_text(),
             )
             _saved_app_config, saved_viewer_config, _saved_raw = self.adapter.load_config(saved_path)
             if saved_viewer_config != self.current_viewer_config:
                 raise ValueError(
                     "Saved configuration does not round-trip to the current diagnostic settings."
                 )
-            if Path(_saved_app_config.folder).expanduser() != (self.folder or Path("")) or _saved_app_config.file != (self.selected_file.name if self.selected_file else None):
+            if Path(_saved_app_config.folder).expanduser() != (self.folder or Path("")) or _saved_app_config.file != self._effective_file_text():
                 raise ValueError("Saved configuration does not preserve the effective data source.")
         except (OSError, TypeError, ValueError) as exc:
             LOGGER.exception("Failed to save tuned configuration")
@@ -5257,9 +5395,7 @@ class DiagnosticViewer:
         selected = self.image_paths[self.index].resolve() if self.image_paths else None
         try:
             app_config, viewer_config, raw = self.adapter.load_config(self.config_path)
-            folder = self.folder_override or (Path(app_config.folder).expanduser() if app_config.folder else None)
-            configured_file = self._cli_selected_file or (Path(app_config.file) if app_config.file else None)
-            image_paths = self.adapter.resolve_images(folder, app_config, configured_file) if folder is not None else []
+            folder, configured_file, image_paths = self._resolve_app_images(app_config)
         except (OSError, ValueError, KeyError) as exc:
             LOGGER.exception("Diagnostic reload failed")
             self._message = f"Reload failed: {exc}"
@@ -5271,7 +5407,7 @@ class DiagnosticViewer:
         self.current_viewer_config = viewer_config
         self.raw_source_config = raw
         self.folder = folder
-        self.selected_file = Path(image_paths[0].name) if configured_file is not None and image_paths else None
+        self.selected_file = configured_file
         self.image_paths = image_paths
         resolved = [path.resolve() for path in image_paths]
         self.index = resolved.index(selected) if selected in resolved else 0
@@ -5418,12 +5554,25 @@ class DiagnosticViewer:
 
         self.close()
 
+    def _set_active_native_dialog(
+        self, resource: _NativeDialogResource | None
+    ) -> None:
+        """Track modal resources so a window close can release them immediately."""
+
+        if resource is not None and self._closed:
+            resource.close()
+            return
+        self._active_native_dialog = resource
+
     def close(self) -> None:
         """Stop timers and release the analysis executor."""
 
         if self._closed:
             return
         self._closed = True
+        active_dialog, self._active_native_dialog = self._active_native_dialog, None
+        if active_dialog is not None:
+            active_dialog.close()
         if self._debounce_timer is not None:
             self._debounce_timer.stop()
         if self._poll_timer is not None:

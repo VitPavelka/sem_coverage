@@ -1096,7 +1096,7 @@ def run_from_config(
     if not config_path.exists():
         save_default_config(
             config_path,
-            r"C:\Users\pavel\Desktop\AVCR\codes\sem_coverage\testData\100226\10 kDa, bare",
+            Path(__file__).resolve().parent / "testData" / "100226" / "10 kDa, bare",
         )
     app_cfg = load_app_config(config_path)
     effective_folder = (

@@ -29,8 +29,8 @@ from export_output_summaries import export_outputs
 from path_utils import (
     coverage_sample_id,
     expand_user_path,
+    resolve_configured_image_source,
     resolve_existing_input_path,
-    resolve_optional_file_in_folder,
 )
 from coverage_cap import sphere_geometry_from_mask
 from sem_bead_viewer import (
@@ -132,21 +132,15 @@ def resolve_coverage_source(
     folder_text = str(getattr(app_config, "folder", "") or "").strip()
     if not folder_text:
         return None
-    root = resolve_existing_input_path(
-        folder_text,
-        config_path=config_path,
-        description="coverage source stored in config",
-    ).resolve()
-    if not root.exists() or not root.is_dir():
-        raise FileNotFoundError(f"Coverage source stored in config does not exist: {root}")
     file_text = getattr(app_config, "file", None)
-    if file_text:
-        selected = resolve_optional_file_in_folder(root, file_text, description="coverage source stored in config")
-        if selected is None or not selected.is_file() or selected.suffix.lower() != ".tif":
-            resolved = selected if selected is not None else root / str(file_text)
-            raise FileNotFoundError(f"Coverage source stored in config does not exist: {resolved}")
-        return ResolvedCoverageSource(root, selected.resolve(), "config")
-    return ResolvedCoverageSource(root, None, "config")
+    root, selected = resolve_configured_image_source(
+        folder_text,
+        file_text,
+        config_path=config_path,
+        description="coverage source",
+        allowed_suffixes=(".tif",),
+    )
+    return ResolvedCoverageSource(root, selected, "config")
 
 
 def resolve_bead_source(
@@ -1379,6 +1373,10 @@ def main(argv: list[str] | None = None) -> None:
             app_config=coverage_app_config,
             config_path=coverage_config_path,
         )
+        if coverage_source is not None:
+            # Match grouped-manifest semantics: validate the complete image
+            # population before creating outputs or starting any analysis.
+            _coverage_source_image_paths(coverage_source, sort_by=args.sort_by)
     if bead_source is None and coverage_source is None and coverage_manifest is None:
         raise SystemExit(
             "No input source was provided. Supply --bead-root/--bead-config, "
